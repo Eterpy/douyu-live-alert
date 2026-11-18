@@ -1,0 +1,5 @@
+**
+!src/
+!src/live_alert/
+!src/live_alert/*.py
+!requirements.lock

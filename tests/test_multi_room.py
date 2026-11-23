@@ -77,10 +77,12 @@ def test_mail_name_prefers_configured_then_platform(
     s.feed("LIVE", 60, owner=owner)
     s.feed("LIVE", 10, owner=owner)
     assert s.worker()
-    assert s.sent[-1]["Subject"] == f"[斗鱼开播] {expected} 已确认开播"
+    assert s.sent[-1]["Subject"] == f"🎙️ {expected} 开播啦～"
+    assert "标题: 未获取" in s.sent[-1].get_content().splitlines()
     s.offline()
     assert s.worker()
-    assert f"主播：{expected}" in s.sent[-1].get_content()
+    assert s.sent[-1]["Subject"] == f"🌙 {expected} 下播休息啦～"
+    assert "标题: 未获取" in s.sent[-1].get_content().splitlines()
 
 
 class FakeDouyu:

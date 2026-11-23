@@ -35,16 +35,67 @@ def live_session(s, start=1020):
 
 
 @pytest.mark.parametrize("start", [REPLAY_START, REPLAY_START - 100])
-def test_replay_show_time_never_opens_session(scenario, start):
+def test_reused_or_older_replay_start_needs_two_live_reads_after_guard(scenario, start):
     s = scenario
     replay_baseline(s)
-    for _ in range(10):
-        s.feed("LIVE", 30, started_at=start)
-    assert not s.events() and s.state.confirmed == "OFFLINE"
+    s.feed("LIVE", 30, started_at=start)
+    s.feed("LIVE", REPLAY_GUARD_SECONDS - 31, started_at=start)
+    assert s.state.window is None and not s.events()
     stored = s.db.execute(
         "SELECT state,reason FROM observations ORDER BY rowid DESC LIMIT 1"
     ).fetchone()
     assert tuple(stored) == ("UNKNOWN", "replay_guard")
+    s.feed("LIVE", 1, started_at=start)  # Exactly at expiry: first usable sample.
+    assert s.state.phase == "LIVE_CANDIDATE" and s.state.window.count == 1
+    s.feed("LIVE", 9, started_at=start)
+    assert not s.events()
+    s.feed("LIVE", 1, started_at=start)
+    assert s.worker()
+    s.feed("LIVE", 30, started_at=start)
+    s.offline()
+    assert s.worker() and not s.worker()
+    assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
+
+
+def test_new_replay_evidence_rearms_guard_and_cancels_a_single_live_read(scenario):
+    s = scenario
+    replay_baseline(s)
+    for _ in range(3):
+        s.feed("LIVE", 50, started_at=REPLAY_START)
+        assert s.state.window is None
+        s.feed("LIVE", 10, started_at=REPLAY_START)
+        assert s.state.phase == "LIVE_CANDIDATE"
+        s.feed("REPLAY", 5, started_at=REPLAY_START)
+        assert s.state.phase == "OFFLINE" and not s.events()
+
+
+def test_unknown_between_live_reads_after_replay_restarts_confirmation(scenario):
+    s = scenario
+    replay_baseline(s)
+    s.feed("LIVE", REPLAY_GUARD_SECONDS, started_at=REPLAY_START)
+    s.feed("UNKNOWN", 5)
+    assert s.state.window is None
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert not s.events()
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.worker() and s.events() == [("LIVE", "SENT")]
+
+
+def test_restart_keeps_replay_deadline_but_rebuilds_live_confirmation(scenario):
+    s = scenario
+    replay_baseline(s)
+    s.restart(REPLAY_GUARD_SECONDS - 2)
+    s.feed("LIVE", 1, started_at=REPLAY_START)
+    assert s.state.window is None
+    s.feed("LIVE", 1, started_at=REPLAY_START)
+    assert s.state.phase == "LIVE_CANDIDATE"
+    s.restart(5)
+    s.feed("LIVE", 5, started_at=REPLAY_START)
+    assert s.state.window.count == 1 and not s.events()
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.state.confirmed == "LIVE_CONFIRMED"
+    # The reused start predates the last offline evidence. No restart catch-up mail.
+    assert s.events() == [("LIVE", "SUPPRESSED_BASELINE")] and not s.worker()
 
 
 def test_live_without_start_waits_out_replay_guard(scenario):
@@ -97,6 +148,235 @@ def test_replay_snapshot_neither_counts_nor_resets_offline_window(scenario):
     s.feed("REPLAY", 60, started_at=REPLAY_START + 1000)
     assert s.state.session is None
     assert s.worker() and s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
+
+
+@pytest.mark.parametrize("correction", [None, -65, 30])
+@pytest.mark.parametrize("restart", [False, True])
+def test_room_63136_reused_start_never_dates_or_duplicates_the_session(
+    scenario, correction, restart
+):
+    s = scenario
+    replay_start = 1795246265
+    s.t = replay_start + 86400
+    s.restart(room_id=63136)
+    s.feed("REPLAY", started_at=replay_start)
+    s.feed("REPLAY", 10, started_at=replay_start)
+    s.feed("LIVE", 30, started_at=replay_start)
+    s.feed("LIVE", 30, started_at=replay_start)
+    s.feed("LIVE", 10, started_at=replay_start)
+    assert s.worker()
+    confirmed = s.t
+    if restart:
+        s.restart(2)
+    start = replay_start if correction is None else confirmed + correction
+    s.feed("LIVE", 30, started_at=start)
+    s.feed("LIVE", 10, started_at=start)
+    assert s.events() == [("LIVE", "SENT")]
+    assert s.db.execute("SELECT first_started_at FROM sessions").fetchone()[0] is None
+    s.offline()
+    assert s.worker() and not s.worker()
+    assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
+    assert "直播时长：未知" in s.sent[-1].get_content()
+
+
+def test_distinct_later_broadcast_after_reused_start_still_rotates(scenario):
+    s = scenario
+    replay_baseline(s)
+    s.feed("LIVE", 60, started_at=REPLAY_START)
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.worker()
+    for _ in range(5):
+        s.feed("LIVE", 30, started_at=REPLAY_START)
+    new_start = s.t + 1
+    s.feed("LIVE", 5, started_at=new_start)
+    s.feed("LIVE", 10, started_at=new_start)
+    assert s.events() == [
+        ("LIVE", "SENT"),
+        ("OFFLINE", "SUPPRESSED_SESSION_CHANGE"),
+        ("LIVE", "PENDING"),
+    ]
+
+
+def test_corroborated_correction_allows_subsequent_real_switch(scenario):
+    s = scenario
+    replay_baseline(s)
+    corrected = s.t + 3
+    s.feed("LIVE", 60, started_at=REPLAY_START)
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.worker()
+    s.feed("LIVE", 10, started_at=corrected)
+    assert s.state.session_started_at is None
+    for _ in range(5):
+        s.feed("LIVE", 2, started_at=corrected)
+    assert s.state.session_started_at == corrected
+    assert s.events() == [("LIVE", "SENT")]
+    next_start = s.t + 1
+    s.feed("LIVE", 5, started_at=next_start)
+    s.feed("LIVE", 10, started_at=next_start)
+    assert s.state.session == 2 and s.worker()
+    assert s.events() == [
+        ("LIVE", "SENT"),
+        ("OFFLINE", "SUPPRESSED_SESSION_CHANGE"),
+        ("LIVE", "SENT"),
+    ]
+
+
+def test_reused_replay_time_stays_untrusted_after_confirmed_offline(scenario):
+    s = scenario
+    replay_baseline(s)
+    s.feed("LIVE", 60, started_at=REPLAY_START)
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.worker()
+    for _ in range(3):
+        s.feed("OFFLINE", 60)
+    assert s.worker()
+    corrected = s.t + 5
+    s.feed("LIVE", 30, started_at=REPLAY_START)
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.worker()
+    s.feed("LIVE", 30, started_at=corrected)
+    s.feed("LIVE", 10, started_at=corrected)
+    assert s.state.session == 2 and s.state.session_started_at == corrected
+    assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT"), ("LIVE", "SENT")]
+
+
+def test_later_replay_hint_keeps_normal_switch_for_preexisting_undated_session(
+    scenario,
+):
+    s = scenario
+    service = Service(s.c, s.db, None, lambda: s.t, lambda: s.t)
+    s.state = service.state
+    s.baseline()
+    s.live()
+    assert s.worker()
+    s.t += 5
+    service.event("replay")
+    next_start = s.t + 2
+    s.feed("LIVE", 5, started_at=next_start)
+    s.feed("LIVE", 10, started_at=next_start)
+    assert s.state.session == 2 and s.worker()
+
+
+@pytest.mark.parametrize("old_first", [True, False])
+def test_alternating_replay_and_real_starts_confirm_live(scenario, old_first):
+    s = scenario
+    replay_baseline(s)
+    new_start = s.t + 5
+    starts = [REPLAY_START, new_start] if old_first else [new_start, REPLAY_START]
+    s.feed("LIVE", 60, started_at=starts[0])
+    s.feed("LIVE", 10, started_at=starts[1])
+    assert s.worker()
+    for start in starts * 3:
+        s.feed("LIVE", 10, started_at=start)
+    assert s.events() == [("LIVE", "SENT")]
+
+
+@pytest.mark.parametrize("source", ["HTTP", "RSS"])
+def test_latest_undated_replay_cannot_borrow_an_older_show_time(scenario, source):
+    s = scenario
+    replay_baseline(s)
+    suspect = s.t + 5
+    if source == "HTTP":
+        s.feed("REPLAY", 30)
+    else:
+        s.t += 30
+        service = Service(s.c, s.db, None, lambda: s.t, lambda: s.t)
+        service.event("replay")
+    s.restart(1)
+    s.feed("LIVE", 5, started_at=suspect)
+    s.feed("LIVE", 10, started_at=suspect)
+    assert s.state.window is None and not s.events()
+    s.feed("LIVE", 44, started_at=suspect)
+    s.feed("LIVE", 10, started_at=suspect)
+    assert s.events() == [("LIVE", "SUPPRESSED_BASELINE")]
+
+
+@pytest.mark.parametrize("clock_step", [-300, 300])
+def test_replay_window_uses_elapsed_time_across_wall_clock_steps(scenario, clock_step):
+    s = scenario
+    replay_baseline(s)
+    replay_end = s.t
+    for elapsed in [5, 15, 59, 60, 70]:
+        s.t = replay_end + elapsed
+        o = Observation(
+            "LIVE", "fixture", s.t, s.t, s.t + clock_step, started_at=REPLAY_START
+        )
+        usable = s.state.observe(o, "timer", s.t)
+        assert usable == (elapsed >= 60)
+        if elapsed < 60:
+            assert s.state.window is None
+    assert s.state.confirmed == "LIVE_CONFIRMED"
+
+
+def test_restart_with_future_replay_time_waits_one_bounded_window(scenario):
+    s = scenario
+    replay_baseline(s)
+    s.restart(-300)
+    s.feed("LIVE", 49, started_at=REPLAY_START)
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.state.window is None and not s.events()
+    s.feed("LIVE", 1, started_at=REPLAY_START)
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.events() == [("LIVE", "SUPPRESSED_BASELINE")]
+
+
+def test_isolated_live_at_replay_expiry_cannot_keep_room_open(scenario):
+    s = scenario
+    live_session(s)
+    for _ in range(6):
+        s.feed("REPLAY", 30, started_at=REPLAY_START)
+        s.worker()
+        s.feed("OFFLINE", 30)
+        s.worker()
+        s.feed("LIVE", 30, started_at=REPLAY_START)
+    assert s.state.confirmed == "OFFLINE"
+    assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
+    assert s.db.execute("SELECT sample_count FROM sessions").fetchone()[0] == 4
+
+
+def test_ambiguous_resume_needs_fresh_independent_recheck(scenario):
+    s = scenario
+    live_session(s)
+    s.feed("REPLAY", 30, started_at=REPLAY_START)
+    s.feed("OFFLINE", 30)
+    first = s.feed("LIVE", 30, started_at=REPLAY_START)
+    assert s.state.phase == "OFFLINE_CANDIDATE" and s.state.window.count == 2
+    assert s.state.next_check() == first.start + 10
+    assert s.db.execute("SELECT mail_ready FROM monitor").fetchone()[0] == 0
+    s.state.observe(first, "duplicate", first.end + 10)
+    s.feed("LIVE", 9, started_at=REPLAY_START)
+    assert s.state.phase == "OFFLINE_CANDIDATE"
+    s.feed("LIVE", 1, started_at=REPLAY_START)
+    assert s.state.phase == "LIVE_CONFIRMED" and s.state.window is None
+    assert s.events() == [("LIVE", "SENT")]
+
+
+@pytest.mark.parametrize("interruption", ["UNKNOWN", "restart", "gap", "RSS"])
+def test_resume_recheck_cannot_bridge_interrupted_evidence(scenario, interruption):
+    s = scenario
+    live_session(s)
+    service = Service(s.c, s.db, None, lambda: s.t, lambda: s.t)
+    s.state = service.state
+    s.feed("REPLAY", 30, started_at=REPLAY_START)
+    s.feed("OFFLINE", 30)
+    s.feed("LIVE", 30, started_at=REPLAY_START)
+    if interruption == "RSS":
+        service.event("possible_offline")
+    elif interruption == "gap":
+        s.t += 20
+    else:
+        if interruption == "UNKNOWN":
+            s.feed("UNKNOWN", 1)
+        else:
+            s.restart(1)
+        assert s.state.window is None
+        s.feed("OFFLINE", 1)
+        assert s.state.window.count == 1
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.state.phase == "OFFLINE_CANDIDATE"
+    s.feed("LIVE", 10, started_at=REPLAY_START)
+    assert s.state.phase == "LIVE_CONFIRMED"
+    assert s.events() == [("LIVE", "SENT")]
 
 
 # Starts missed while the service was down
@@ -310,7 +590,7 @@ def test_offline_mail_duration_uses_original_start_after_resume(scenario):
     assert s.worker()
     body = s.sent[-1].get_content()
     # 1020 -> first offline sample 60 s after the last live one: 63 minutes.
-    assert "直播时长：约 1 小时 3 分钟" in body
+    assert body.splitlines()[-1] == "直播时长：约 1 小时 3 分钟"
 
 
 def test_offline_mail_duration_unknown_without_trusted_start(scenario):
@@ -557,13 +837,13 @@ def test_unstorable_title_characters_are_dropped(scenario):
     s.feed("LIVE", 30, title=o.title)
     s.feed("LIVE", 10, title=o.title)
     assert s.worker()
-    assert "直播标题：正常标题" in s.sent[-1].get_content()
+    assert "标题: 正常标题" in s.sent[-1].get_content().splitlines()
     # Defence in depth: raw text reaching the state machine is cleaned as well.
     s.offline()
     s.feed("LIVE", 30, title=title, owner="主播\ud800")
     s.feed("LIVE", 10, title=title, owner="主播\ud800")
     assert s.worker()
-    assert s.sent[-1]["Subject"] == "[斗鱼开播] 主播 已确认开播"
+    assert s.sent[-1]["Subject"] == "🎙️ 主播 开播啦～"
 
 
 def test_non_utf8_env_value_is_rejected_with_hint():
@@ -804,7 +1084,8 @@ def test_restore_guard_requires_uninterrupted_offline_evidence(
             if interruption == "unknown":
                 s.feed("UNKNOWN", 30)
             else:
-                s.feed("LIVE", 30, started_at=start - 100)
+                s.feed("REPLAY", 15, started_at=start - 100)
+                s.feed("LIVE", 15, started_at=start - 100)
     s.feed("OFFLINE", 5)
     s.feed("LIVE", 5, started_at=start)
     s.feed("LIVE", 10, started_at=start)

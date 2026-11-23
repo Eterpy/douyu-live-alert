@@ -100,27 +100,35 @@ def test_health_and_backoff_despite_rss(scenario):
     assert not s.events()
 
 
-def test_health_degrades_during_replay_artifacts_and_recovers_on_valid_evidence(
-    scenario,
+@pytest.mark.parametrize("recent_replay_hint", [False, True])
+def test_sampler_recovers_from_persisted_replay_without_a_new_start(
+    scenario, recent_replay_hint
 ):
     s = scenario
     s.baseline()
     s.feed("REPLAY", 5, started_at=950)
+    s.t += 660  # Old deployment stopped accepting evidence more than 10 minutes ago.
     start = s.t
     states = []
 
     class ReplayRoom:
         async def sample(self):
-            if s.t - start >= 660:
-                states.append(service.health)
+            if s.t - start >= 90:
                 service.stop.set()
-                return Observation("OFFLINE", "fixture", s.t, s.t, s.t)
-            return Observation("LIVE", "fixture", s.t, s.t, s.t, started_at=950)
+            return Observation(
+                "LIVE", "live_without_loop", s.t, s.t, s.t, started_at=950
+            )
 
     service = Service(s.c, s.db, ReplayRoom(), lambda: s.t, lambda: s.t)
     service.event("connected")
+    service.tick()
+    assert service.health == "DEGRADED"
+    if recent_replay_hint:
+        service.event("replay")
 
     async def wait(delay):
+        row = s.db.execute("SELECT health,mail_ready FROM monitor").fetchone()
+        states.append(tuple(row))
         s.t += delay
 
     with (
@@ -128,9 +136,47 @@ def test_health_degrades_during_replay_artifacts_and_recovers_on_valid_evidence(
         patch("random.uniform", return_value=1),
     ):
         asyncio.run(service.sample_loop())
-    assert states == ["DEGRADED"]
-    assert service.health == "OK"
-    assert not s.events()
+    assert states[0] == (("DEGRADED", 0) if recent_replay_hint else ("OK", 1))
+    assert states[-1] == ("OK", 1)
+    assert service.state.confirmed == "LIVE_CONFIRMED"
+    assert s.events() == [("LIVE", "SUPPRESSED_BASELINE")] and not s.worker()
+
+
+def test_sampler_prioritizes_rechecking_live_during_pending_end(scenario):
+    s = scenario
+    s.baseline()
+    s.live()
+    assert s.worker()
+    start = s.t
+    reads = []
+
+    class Room:
+        async def sample(self):
+            elapsed = s.t - start
+            reads.append(elapsed)
+            state = {0: "REPLAY", 30: "OFFLINE"}.get(elapsed, "LIVE")
+            if elapsed >= 70:
+                service.stop.set()
+            return Observation(state, "fixture", s.t, s.t, s.t, started_at=900)
+
+    service = Service(s.c, s.db, Room(), lambda: s.t, lambda: s.t)
+
+    async def wait(delay):
+        if s.t == start + 60:
+            assert s.db.execute("SELECT mail_ready FROM monitor").fetchone()[0] == 0
+        s.t += delay
+        if s.t == start + 70:
+            assert service.rank("timer") == (0, start + 78)
+
+    with (
+        patch.object(service, "wait_for_sample", wait),
+        patch("random.uniform", return_value=1),
+    ):
+        asyncio.run(service.sample_loop())
+    assert reads == [0, 30, 60, 70]
+    assert service.state.phase == "LIVE_CONFIRMED"
+    assert s.db.execute("SELECT mail_ready FROM monitor").fetchone()[0] == 1
+    assert s.events() == [("LIVE", "SENT")]
 
 
 def test_replay_burst_preserves_nonlive_baseline_and_cancels_live_candidate(scenario):

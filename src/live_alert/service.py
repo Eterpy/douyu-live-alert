@@ -148,6 +148,7 @@ class Service:
                 )
         if kind in ("replay", "possible_offline"):
             self.live_evidence_epoch += 1
+            self.state.interrupt_live_checks()
             if kind == "replay":
                 self.state.note_replay(self.utc())
             if self.state.window and self.state.window.kind == "LIVE":
@@ -323,6 +324,13 @@ class Service:
         # Only the sample that will count toward an open window outranks others;
         # earlier hint-driven samples would be ignored by the window anyway.
         if w is not None and due is not None and now >= due:
+            if self.state.resume_check is not None:
+                return (
+                    0,
+                    self.state.resume_check.end
+                    + self.c.live_confirm_gap_seconds
+                    + self.c.http_timeout_seconds,
+                )
             cadence = (
                 self.c.offline_confirm_seconds
                 if self.state.phase == "OFFLINE_CANDIDATE"

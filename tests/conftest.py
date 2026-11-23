@@ -27,7 +27,7 @@ class Scenario:
     def __init__(self, c, db):
         self.c, self.db = c, db
         self.t = 1000
-        self.state = MonitorState(db, c, self.t)
+        self.state = MonitorState(db, c, self.t, lambda: self.t)
         self.sent = []
 
     def feed(self, value, delta=0, **fields):
@@ -53,7 +53,7 @@ class Scenario:
         self.t += delay
         self.c = replace(self.c, **changes)
         initialize(self.db, self.c)
-        self.state = MonitorState(self.db, self.c, self.t)
+        self.state = MonitorState(self.db, self.c, self.t, lambda: self.t)
 
     def events(self):
         return [

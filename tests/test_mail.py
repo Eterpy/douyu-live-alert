@@ -20,10 +20,10 @@ def test_waiting_dependency_and_retry_order(scenario):
     assert s.worker()
     s.offline()
     assert s.worker()
-    assert [m["Subject"][:6] for m in s.sent] == [
-        "[斗鱼开播]",
-        "[斗鱼开播]",
-        "[斗鱼下播]",
+    assert [m["Subject"] for m in s.sent] == [
+        "🎙️ 斗鱼房间 10001 开播啦～",
+        "🎙️ 斗鱼房间 10001 开播啦～",
+        "🌙 斗鱼房间 10001 下播休息啦～",
     ]
 
 
@@ -106,7 +106,7 @@ def test_optional_pairing(scenario, setting, value, expected):
     assert s.events()[-1] == ("OFFLINE", expected)
     if setting == "offline_requires_live_email":
         assert s.worker() and not s.worker()
-        assert [m["Subject"][:6] for m in s.sent] == ["[斗鱼下播]"]
+        assert [m["Subject"] for m in s.sent] == ["🌙 斗鱼房间 10001 下播休息啦～"]
 
 
 @pytest.mark.parametrize(

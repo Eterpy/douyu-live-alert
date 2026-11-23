@@ -2,7 +2,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -12,12 +12,15 @@ from .storage import audit
 
 # aiodouyu's LiveStatusMonitor defers conflicting live snapshots this long after a replay.
 REPLAY_GUARD_SECONDS = 60
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def local(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch, ZoneInfo("Asia/Shanghai")).isoformat(
-        timespec="seconds"
-    )
+    return datetime.fromtimestamp(epoch, SHANGHAI).isoformat(timespec="seconds")
+
+
+def mail_time(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def duration(seconds: float) -> str:
@@ -25,12 +28,19 @@ def duration(seconds: float) -> str:
     return f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟"
 
 
+def sample_gap(previous: Observation, current: Observation) -> float:
+    # During host suspend UTC can advance while the monotonic clock stands still.
+    return max(
+        current.start - previous.end,
+        current.utc - (current.end - current.start) - previous.utc,
+    )
+
+
 @dataclass
 class Window:
     kind: str
     first: Observation
     last: Observation
-    origin: str
     started_at: int | None
     count: int = 1
 
@@ -63,6 +73,12 @@ class MonitorState:
         self.last_offline: float | None = row["last_offline"]
         self.replay_at: float | None = row["replay_at"]
         self.replay_start: int | None = row["replay_start"]
+        self.replay_deadline: float | None = None
+        if self.replay_at is not None:
+            age = max(0.0, now - self.replay_at)
+            self.replay_deadline = monotonic() + max(0.0, REPLAY_GUARD_SECONDS - age)
+        self.resume_check: Observation | None = None
+        self.correction_check: Observation | None = None
         # First non-live evidence since the session's last live sample.
         self.offline_first: float | None = row["offline_first"]
         # Set by restore: sessions starting before it may already have been notified.
@@ -132,39 +148,65 @@ class MonitorState:
             ),
         )
 
-    def note_replay(self, utc: float) -> None:
-        """A realtime replay event arms the guard against lagging live snapshots."""
+    def interrupt_live_checks(self) -> None:
+        self.resume_check = None
+        self.correction_check = None
+
+    def _record_replay(self, utc: float, end: float, start: int | None) -> None:
         self.replay_at = utc
+        self.replay_start = start
+        self.replay_deadline = end + REPLAY_GUARD_SECONDS
+        self.interrupt_live_checks()
+
+    def note_replay(self, utc: float) -> None:
+        """A realtime replay event carries no platform start time."""
+        self._record_replay(utc, self.monotonic(), None)
         with self.db:
             self._persist()
 
-    def _replay_artifact(self, o: Observation) -> bool:
-        """Douyu can briefly report a replay room as live. Such snapshots carry the
-        replay's show_time, an older one, or none at all. While a session is live only
-        the replay's own show_time is rejected: ignoring a real resume could falsely
-        end the session, whereas accepting an artifact merely delays the end."""
+    def _live_evidence(self, o: Observation, now: float) -> Observation:
+        spacing = self.c.live_confirm_gap_seconds
+        max_gap = spacing + self.c.http_timeout_seconds
+        if now - o.end > max_gap:
+            return replace(o, state="UNKNOWN", reason="stale_live_evidence")
+
         start = o.started_at
-        if start is not None and start == self.replay_start:
-            return True
-        if self.confirmed == "LIVE_CONFIRMED":
-            return False
-        if start is not None and self.replay_start is not None:
-            # A broadcast that ends a replay must start after the replay did.
-            return start < self.replay_start
-        if self.replay_at is None or not (
-            0 <= o.utc - self.replay_at < REPLAY_GUARD_SECONDS
-        ):
-            return False
-        return start is None or start <= self.replay_at
+        boundary = (
+            self.replay_start if self.replay_start is not None else self.replay_at
+        )
+        replay_time = start is not None and boundary is not None and start <= boundary
+        if self.replay_deadline is not None and o.end < self.replay_deadline:
+            guarded = (
+                start is not None and start == self.replay_start
+                if self.confirmed == "LIVE_CONFIRMED"
+                else replay_time or start is None
+            )
+            if guarded:
+                self.resume_check = None
+                return replace(o, state="UNKNOWN", reason="replay_guard")
+
+        if self.phase == "OFFLINE_CANDIDATE" and replay_time:
+            # One live-looking replay must neither cancel nor confirm a pending end.
+            previous = self.resume_check
+            if previous is None or sample_gap(previous, o) > max_gap:
+                self.resume_check = o
+                return replace(o, state="UNKNOWN", reason="replay_resume_check")
+            if o.start < previous.end or o.start - previous.start < spacing:
+                return replace(o, state="UNKNOWN", reason="replay_resume_check")
+        # A valid LIVE verdict and a trustworthy session start are separate facts.
+        return replace(o, started_at=None) if replay_time else o
 
     def interrupt(self, reason: str) -> None:
         before = self.phase
+        self.interrupt_live_checks()
         self.window, self.phase = None, self.confirmed
         with self.db:
             self._persist()
         audit(self.c, "rss", before, self.phase, reason, session=self.session)
 
     def next_check(self) -> float | None:
+        if self.resume_check is not None:
+            return self.resume_check.start + self.c.live_confirm_gap_seconds
         w = self.window
         if not w:
             return None
@@ -185,9 +227,6 @@ class MonitorState:
     ) -> bool:
         """Commit the observation and report whether it supplied usable evidence."""
         before = self.phase
-        state, reason = o.state, o.reason
-        if state == "LIVE" and self._replay_artifact(o):
-            state, reason = "UNKNOWN", "replay_guard"
         with self.db:
             inserted = self.db.execute(
                 "INSERT OR IGNORE INTO observations VALUES (?,?,?,?,?,?,?,?)",
@@ -196,8 +235,8 @@ class MonitorState:
                     self.c.room_id,
                     o.utc,
                     trigger,
-                    state,
-                    reason,
+                    o.state,
+                    o.reason,
                     json.dumps(o.raw),
                     o.end - o.start,
                 ),
@@ -205,6 +244,13 @@ class MonitorState:
             if not inserted.rowcount:
                 return False
             now = self.monotonic() if mono_now is None else mono_now
+            if o.state == "LIVE":
+                o = self._live_evidence(o, now)
+                if o.state == "UNKNOWN":
+                    self.db.execute(
+                        "UPDATE observations SET state=?,reason=? WHERE id=?",
+                        (o.state, o.reason, o.id),
+                    )
             if (
                 self.last_seen is not None
                 and o.utc - self.last_seen > self.evidence_gap_limit
@@ -213,30 +259,25 @@ class MonitorState:
                 if self.gap_reference is None:
                     self.gap_reference = self.last_seen
             usable = False
-            if reason == "replay_guard":
+            if o.reason in ("replay_guard", "replay_resume_check"):
                 # Neither counts toward nor resets a confirmation window.
                 self.last_seen = o.utc
-            elif (
-                state == "LIVE"
-                and now - o.end
-                > self.c.live_confirm_gap_seconds + self.c.http_timeout_seconds
-            ):
-                reason = "stale_live_evidence"
-                self.window, self.phase = None, self.confirmed
-            elif state not in ("LIVE", "OFFLINE", "REPLAY"):
+            elif o.state not in ("LIVE", "OFFLINE", "REPLAY"):
+                self.resume_check = None
                 self.window, self.phase = None, self.confirmed
             else:
                 # The write lock can delay processing after the sample has returned.
+                self.resume_check = None
                 self._advance(o, now, trigger)
                 usable = True
                 self._settle_restore(o)
                 self.last_valid = self.last_seen = o.utc
-                if state != "LIVE":
+                if o.state != "LIVE":
                     self.last_offline = o.utc
-                if state == "REPLAY":
-                    self.replay_at = o.utc
-                    if o.started_at is not None:
-                        self.replay_start = o.started_at
+                if o.state == "REPLAY":
+                    self._record_replay(o.utc, o.end, o.started_at)
+            if not usable or o.state != "LIVE":
+                self.correction_check = None
             if not usable:
                 self.restore_quiet_since = None
             self.db.execute(
@@ -249,7 +290,7 @@ class MonitorState:
             trigger,
             before,
             self.phase,
-            reason,
+            o.reason,
             observation=o.id,
             session=self.session,
             samples=self.window.count if self.window else 0,
@@ -264,14 +305,24 @@ class MonitorState:
             and o.utc - self.last_valid > self.c.max_notification_age_seconds
         ):
             self.stale = True
+        switch_after = self.session_started_at or self.session_live_at or o.utc
+        resuming = self._resumed(o)
+        undated_after_replay = (
+            self.session_started_at is None
+            and self.replay_at is None
+            and self.replay_start is not None
+        )
+        # When replay made the start uncertain, a correction can lead local
+        # confirmation by the platform's clock skew and still describe this session.
+        if undated_after_replay and not resuming:
+            switch_after += CLOCK_SKEW_SECONDS
         switching = (
             self.confirmed == "LIVE_CONFIRMED"
             and live
             and o.started_at is not None
-            and o.started_at
-            > (self.session_started_at or self.session_live_at or o.utc)
+            and o.started_at > switch_after
         )
-        if switching and self._resumed(o):
+        if switching and resuming:
             # Back within the offline confirmation period: same broadcast, new start.
             audit(
                 self.c,
@@ -282,16 +333,14 @@ class MonitorState:
                 session=self.session,
                 started_at=o.started_at,
             )
-            self.session_started_at = o.started_at
+            self._set_session_start(o.started_at)
             self.gap_reference = None
-            self.db.execute(
-                "UPDATE sessions SET started_at=? WHERE id=?",
-                (o.started_at, self.session),
-            )
             self.offline_first = None
             self.window, self.phase = None, self.confirmed
             return
         if self.confirmed == "LIVE_CONFIRMED" and live and not switching:
+            if undated_after_replay and self.gap_reference is None and not self.stale:
+                self._check_corrected_start(o)
             # Even without a show_time, this read proves monitoring has resumed.
             if self.gap_reference is not None and self.first_live_after_gap is None:
                 self.first_live_after_gap = o.utc
@@ -305,6 +354,7 @@ class MonitorState:
             self.window, self.phase = None, self.confirmed
             return
         if switching:
+            self.correction_check = None
             self.stale = True
         if self.confirmed == "OFFLINE" and not live:
             self.reconciling = False
@@ -324,8 +374,7 @@ class MonitorState:
                 if closing
                 else self.c.live_confirm_gap_seconds
             )
-            # A host suspend can advance UTC while its monotonic clock stands still.
-            gap = max(o.start - w.last.end, o.utc - (o.end - o.start) - w.last.utc)
+            gap = sample_gap(w.last, o)
             different_start = (
                 live
                 and w.started_at is not None
@@ -343,7 +392,7 @@ class MonitorState:
                 )
                 w = None
         if w is None or w.kind != kind:
-            self.window = Window(kind, o, o, trigger, o.started_at)
+            self.window = Window(kind, o, o, o.started_at)
             if self.confirmed != "BASELINING":
                 self.phase = "OFFLINE_CANDIDATE" if closing else "LIVE_CANDIDATE"
             return
@@ -409,6 +458,31 @@ class MonitorState:
             self.confirmed = self.phase = "OFFLINE"
         self.reconciling, self.window = False, None
         self.gap_reference = None
+
+    def _set_session_start(self, start: int | None) -> None:
+        self.correction_check = None
+        self.session_started_at = start
+        self.db.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (start, self.session)
+        )
+
+    def _check_corrected_start(self, o: Observation) -> None:
+        # Two consistent corrections establish identity for future switches.
+        # The start recorded for the original notice/duration stays unknown.
+        first = self.correction_check
+        if o.started_at is None:
+            self.correction_check = None
+        elif (
+            first is None
+            or first.started_at != o.started_at
+            or sample_gap(first, o) > self.evidence_gap_limit
+        ):
+            self.correction_check = o
+        elif (
+            o.start >= first.end
+            and o.start - first.start >= self.c.live_confirm_gap_seconds
+        ):
+            self._set_session_start(o.started_at)
 
     def _settle_restore(self, o: Observation) -> None:
         """Forget the restore point once the room has stayed off for a full offline
@@ -490,18 +564,20 @@ class MonitorState:
         self.confirmed = self.phase = "LIVE_CONFIRMED"
         self.stale = False
         self.offline_first = None
-        self.replay_at = self.replay_start = None
-        subject = f"[斗鱼开播] {name} 已确认开播"
-        origin = {
-            "possible_live": "实时状态事件",
-            "connected": "连接对账",
-            "startup": "启动对账",
-            "timer": "定时检查",
-        }.get(w.origin, "状态检查")
+        # Retire the timer. For an undated session keep only the replay boundary,
+        # so a restart can still recognize a reused time or a later correction.
+        if self.session_started_at is not None:
+            self.replay_start = None
+        elif self.replay_start is None and self.replay_at is not None:
+            self.replay_start = int(self.replay_at)
+        self.replay_at = self.replay_deadline = None
+        self.correction_check = None
+        subject = f"🎙️ {name} 开播啦～"
         body = (
-            f"主播：{name}\n直播间：https://www.douyu.com/{c.room_id}\n"
-            f"会话：{self.session}\n直播标题：{title or '未获取'}\n确认开播时间：{local(o.utc)}\n"
-            f"检测方式：{origin}，{w.count} 次独立 HTTP 确认"
+            "📣 直播间有新动静啦～\n"
+            f"直播间：https://www.douyu.com/{c.room_id}\n"
+            f"标题: {title or '未获取'}\n"
+            f"本场确认开播时间：{mail_time(o.utc)}"
         )
         state = (
             "SUPPRESSED_BASELINE"
@@ -550,20 +626,19 @@ class MonitorState:
                 prior_state == "SIMULATED" and state == "SIMULATED"
             ):
                 state = "SUPPRESSED_NO_LIVE_NOTICE"
-        subject = f"[斗鱼下播] {row['name']} 已结束直播"
+        subject = f"🌙 {row['name']} 下播休息啦～"
         first_start = row["first_started_at"]
         # The stream ended before the first offline sample; the span is approximate.
         length = (
-            f"约 {duration(w.first.utc - first_start)}（平台开播时间 "
-            f"{local(first_start)} 至首次检测到离线）"
+            f"约 {duration(w.first.utc - first_start)}"
             if first_start is not None
             else "未知"
         )
         body = (
-            f"主播：{row['name']}\n直播间：https://www.douyu.com/{c.room_id}\n"
-            f"会话：{self.session}\n本场确认开播时间：{local(row['live_at'])}\n"
-            f"首次检测到离线时间：{local(w.first.utc)}\n确认下播时间：{local(o.utc)}\n"
-            f"稳定确认：{o.end - w.first.end:.0f} 秒，{w.count} 次独立 HTTP 非直播证据\n"
+            "🌙 直播间安静下来啦，记录放在这里～\n"
+            f"直播间：https://www.douyu.com/{c.room_id}\n"
+            f"标题: {row['title'] or '未获取'}\n"
+            f"确认下播时间：{mail_time(o.utc)}\n"
             f"直播时长：{length}"
         )
         self._enqueue("OFFLINE", state, subject, body, o.utc)

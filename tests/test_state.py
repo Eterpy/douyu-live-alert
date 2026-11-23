@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime
 
 import pytest
 
@@ -7,28 +8,34 @@ from live_alert.douyu import Observation
 
 def test_full_cycle_two_template_contents_and_order(scenario):
     s = scenario
+    s.t = datetime.fromisoformat("2026-11-22T20:19:42+08:00").timestamp()
     s.baseline()
-    s.feed("LIVE", 30, title="fixture")
+    started = int(s.t + 30)
+    s.feed("LIVE", 30, started_at=started, title="灵狐，为我引路！", owner="测试主播")
     s.feed("LIVE", 9)
     assert not s.events()
-    s.feed("LIVE", 1, title="fixture")
+    s.feed("LIVE", 1, started_at=started, title="灵狐，为我引路！", owner="测试主播")
     assert s.worker()
     s.offline()
     assert s.worker()
     assert not s.worker()
     assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
     start, end = s.sent
-    assert "[斗鱼开播]" in start["Subject"] and "[斗鱼下播]" in end["Subject"]
-    for msg in s.sent:
-        assert (
-            "https://www.douyu.com/10001" in msg.get_content()
-            and "会话：1" in msg.get_content()
-        )
-    assert "fixture" in start.get_content() and "+08:00" in start.get_content()
-    assert (
-        "首次检测到离线时间" in end.get_content()
-        and "120 秒，3 次" in end.get_content()
-    )
+    assert start["Subject"] == "🎙️ 测试主播 开播啦～"
+    assert start.get_content().splitlines() == [
+        "📣 直播间有新动静啦～",
+        "直播间：https://www.douyu.com/10001",
+        "标题: 灵狐，为我引路！",
+        "本场确认开播时间：2026-11-22 20:20:32",
+    ]
+    assert end["Subject"] == "🌙 测试主播 下播休息啦～"
+    assert end.get_content().splitlines() == [
+        "🌙 直播间安静下来啦，记录放在这里～",
+        "直播间：https://www.douyu.com/10001",
+        "标题: 灵狐，为我引路！",
+        "确认下播时间：2026-11-22 20:23:32",
+        "直播时长：约 1 分钟",
+    ]
     s.live()
     assert s.state.session == 2 and s.events()[-1] == ("LIVE", "PENDING")
 

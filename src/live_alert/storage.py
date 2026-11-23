@@ -106,10 +106,14 @@ def migrate(db: sqlite3.Connection) -> None:
         if name not in columns:
             db.execute(f"ALTER TABLE monitor ADD COLUMN {name} {ddl}")
     # started_at follows a resumed broadcast; the original start dates the duration.
-    if "first_started_at" not in {
-        r[1] for r in db.execute("PRAGMA table_info(sessions)")
-    }:
-        with db:
+    # Legacy sqlite3 transaction control autocommits DDL. Open the transaction
+    # explicitly so the column and its backfill commit together: a column left
+    # without the backfill would be skipped on every later start.
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        if "first_started_at" not in {
+            r[1] for r in db.execute("PRAGMA table_info(sessions)")
+        }:
             db.execute("ALTER TABLE sessions ADD COLUMN first_started_at INTEGER")
             db.execute("UPDATE sessions SET first_started_at=started_at")
 

@@ -1,7 +1,7 @@
 services:
   alert:
     build: .
-    image: douyu-live-alert:2.0.1
+    image: douyu-live-alert:2.0.2
     restart: unless-stopped
     init: true
     env_file: .env

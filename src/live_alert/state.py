@@ -36,6 +36,10 @@ def sample_gap(previous: Observation, current: Observation) -> float:
     )
 
 
+# The first and the latest of consecutive reads carrying the same start.
+Pair = tuple[Observation, Observation]
+
+
 @dataclass
 class Window:
     kind: str
@@ -78,7 +82,10 @@ class MonitorState:
             age = max(0.0, now - self.replay_at)
             self.replay_deadline = monotonic() + max(0.0, REPLAY_GUARD_SECONDS - age)
         self.resume_check: Observation | None = None
-        self.correction_check: Observation | None = None
+        # (first, latest) consecutive reads of one start; see _repeated().
+        self.correction_check: Pair | None = None
+        # Reads of the dated session's own start at or before a replay boundary.
+        self.identity_check: Pair | None = None
         # First non-live evidence since the session's last live sample.
         self.offline_first: float | None = row["offline_first"]
         # Set by restore: sessions starting before it may already have been notified.
@@ -151,6 +158,7 @@ class MonitorState:
     def interrupt_live_checks(self) -> None:
         self.resume_check = None
         self.correction_check = None
+        self.identity_check = None
 
     def _record_replay(self, utc: float, end: float, start: int | None) -> None:
         self.replay_at = utc
@@ -175,6 +183,11 @@ class MonitorState:
             self.replay_start if self.replay_start is not None else self.replay_at
         )
         replay_time = start is not None and boundary is not None and start <= boundary
+        own_start = (
+            self.confirmed == "LIVE_CONFIRMED"
+            and start is not None
+            and start == self.session_started_at
+        )
         if self.replay_deadline is not None and o.end < self.replay_deadline:
             guarded = (
                 start is not None and start == self.replay_start
@@ -182,8 +195,21 @@ class MonitorState:
                 else replay_time or start is None
             )
             if guarded:
-                self.resume_check = None
+                self.resume_check = self.identity_check = None
                 return replace(o, state="UNKNOWN", reason="replay_guard")
+
+        # A replay boundary can postdate the session's own start. One run of reads
+        # decides whether that start identifies the session again (e.g. to renew
+        # eligibility after a restart), for pending-end rechecks and ordinary live
+        # reads alike. Every read past the guard extends or breaks the run, and
+        # the run survives the end of a pending end.
+        repeated = False
+        if replay_time and own_start:
+            self.identity_check, repeated = self._repeated(self.identity_check, o)
+        else:
+            self.identity_check = None
+        # A valid LIVE verdict and a trustworthy session start are separate facts.
+        verified = o if repeated or not replay_time else replace(o, started_at=None)
 
         if self.phase == "OFFLINE_CANDIDATE" and replay_time:
             # One live-looking replay must neither cancel nor confirm a pending end.
@@ -193,12 +219,14 @@ class MonitorState:
                 return replace(o, state="UNKNOWN", reason="replay_resume_check")
             if o.start < previous.end or o.start - previous.start < spacing:
                 return replace(o, state="UNKNOWN", reason="replay_resume_check")
-        # A valid LIVE verdict and a trustworthy session start are separate facts.
-        return replace(o, started_at=None) if replay_time else o
+        return verified
 
     def interrupt(self, reason: str) -> None:
         before = self.phase
-        self.interrupt_live_checks()
+        # The cancelled window takes its pending-end recheck with it. Identity
+        # and correction runs only end on contradicting evidence: the service
+        # clears them for replay/offline hints, but a live hint agrees with them.
+        self.resume_check = None
         self.window, self.phase = None, self.confirmed
         with self.db:
             self._persist()
@@ -278,6 +306,9 @@ class MonitorState:
                     self._record_replay(o.utc, o.end, o.started_at)
             if not usable or o.state != "LIVE":
                 self.correction_check = None
+                # A withheld recheck is still an independent read of the session.
+                if o.reason != "replay_resume_check":
+                    self.identity_check = None
             if not usable:
                 self.restore_quiet_since = None
             self.db.execute(
@@ -461,27 +492,38 @@ class MonitorState:
 
     def _set_session_start(self, start: int | None) -> None:
         self.correction_check = None
+        self.identity_check = None
         self.session_started_at = start
         self.db.execute(
             "UPDATE sessions SET started_at=? WHERE id=?", (start, self.session)
         )
 
+    def _repeated(self, pair: Pair | None, o: Observation) -> tuple[Pair, bool]:
+        """Extend a run of consecutive reads carrying o's start and report whether
+        o independently repeats the first one. Continuity is judged between
+        neighbouring reads, spacing against the first: the confirmation gap may
+        exceed the evidence gap limit (LIVE_CONFIRM_GAP_SECONDS up to 300)."""
+        if (
+            pair is None
+            or pair[0].started_at != o.started_at
+            or sample_gap(pair[1], o) > self.evidence_gap_limit
+        ):
+            return (o, o), False
+        first = pair[0]
+        repeated = (
+            o.start >= first.end
+            and o.start - first.start >= self.c.live_confirm_gap_seconds
+        )
+        return (first, o), repeated
+
     def _check_corrected_start(self, o: Observation) -> None:
         # Two consistent corrections establish identity for future switches.
         # The start recorded for the original notice/duration stays unknown.
-        first = self.correction_check
         if o.started_at is None:
             self.correction_check = None
-        elif (
-            first is None
-            or first.started_at != o.started_at
-            or sample_gap(first, o) > self.evidence_gap_limit
-        ):
-            self.correction_check = o
-        elif (
-            o.start >= first.end
-            and o.start - first.start >= self.c.live_confirm_gap_seconds
-        ):
+            return
+        self.correction_check, repeated = self._repeated(self.correction_check, o)
+        if repeated:
             self._set_session_start(o.started_at)
 
     def _settle_restore(self, o: Observation) -> None:
@@ -571,7 +613,7 @@ class MonitorState:
         elif self.replay_start is None and self.replay_at is not None:
             self.replay_start = int(self.replay_at)
         self.replay_at = self.replay_deadline = None
-        self.correction_check = None
+        self.correction_check = self.identity_check = None
         subject = f"🎙️ {name} 开播啦～"
         body = (
             "📣 直播间有新动静啦～\n"

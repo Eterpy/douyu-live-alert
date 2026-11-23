@@ -101,6 +101,61 @@ def test_redirect_is_followed_without_reading_the_redirect_body():
     assert follow.call_args.args[0].full_url == "https://www.douyu.com/new"
 
 
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://www.douyu.com/new",
+        "HTTP://www.douyu.com/new",
+        "ftp://www.douyu.com/new",
+    ],
+)
+def test_redirect_never_leaves_https(location):
+    handler = http_worker._SkipRedirectBody()
+    handler.add_parent(OpenerDirector())
+    req = Request("https://www.douyu.com/old")
+    req.timeout = 2
+    headers = Message()
+    headers["Location"] = location
+    body = BytesIO()
+    with (
+        patch.object(handler.parent, "open") as follow,
+        pytest.raises(http_worker.InsecureRedirect),
+    ):
+        handler.http_error_302(req, body, 302, "redirect", headers)
+    assert body.closed and not follow.called
+
+
+@pytest.mark.parametrize(
+    "location,expected",
+    [
+        ("https://m.douyu.com/new", "https://m.douyu.com/new"),
+        ("//m.douyu.com/new", "https://m.douyu.com/new"),
+    ],
+)
+def test_https_redirects_are_still_followed(location, expected):
+    handler = http_worker._SkipRedirectBody()
+    handler.add_parent(OpenerDirector())
+    req = Request("https://www.douyu.com/old")
+    req.timeout = 2
+    headers = Message()
+    headers["Location"] = location
+    with patch.object(handler.parent, "open") as follow:
+        handler.http_error_301(req, BytesIO(), 301, "redirect", headers)
+    assert follow.call_args.args[0].full_url == expected
+
+
+def test_worker_reports_insecure_redirect_as_failure(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["worker", "42", "2", "betard"])
+    with patch.object(
+        OpenerDirector, "open", side_effect=http_worker.InsecureRedirect()
+    ):
+        http_worker.main()
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "InsecureRedirect",
+        "code": None,
+    }
+
+
 def test_worker_ignores_modules_in_working_directory(tmp_path, monkeypatch):
     import asyncio
 

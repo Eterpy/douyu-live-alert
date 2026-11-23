@@ -379,6 +379,190 @@ def test_resume_recheck_cannot_bridge_interrupted_evidence(scenario, interruptio
     assert s.events() == [("LIVE", "SENT")]
 
 
+def replay_during_session(s, source, start):
+    """Replay evidence whose boundary is not earlier than the session's start."""
+    if source == "RSS":
+        s.t += 5
+        service = Service(s.c, s.db, None, lambda: s.t, lambda: s.t)
+        s.state = service.state
+        service.event("replay")
+    elif source in ("HTTP_same", "HTTP_later"):
+        replay_start = start if source == "HTTP_same" else int(s.t)
+        s.feed("REPLAY", 30, started_at=replay_start)
+        s.feed("LIVE", 30, started_at=start)
+        # The sampler's fast rechecks. A reused replay start waits out the guard
+        # (reads at 40-60 s), then needs a pair; a later replay start only a pair.
+        for _ in range(4 if source == "HTTP_same" else 1):
+            assert s.state.phase == "OFFLINE_CANDIDATE"
+            s.feed("LIVE", 10, started_at=start)
+        assert s.state.phase == "LIVE_CONFIRMED"
+
+
+@pytest.mark.parametrize("source", [None, "RSS", "HTTP_same", "HTTP_later"])
+def test_replay_during_session_keeps_offline_mail_after_long_restart(scenario, source):
+    s = scenario
+    start = 1020
+    live_session(s, start)
+    s.feed("LIVE", 30, started_at=start)
+    replay_during_session(s, source, start)
+    for _ in range(4):
+        s.feed("LIVE", 30, started_at=start)
+    assert s.state.confirmed == "LIVE_CONFIRMED" and s.events() == [("LIVE", "SENT")]
+    s.restart(s.c.offline_restart_grace_seconds + 1)
+    assert s.state.stale
+    s.feed("LIVE", 30, started_at=start)
+    # One read is not enough when a replay may have carried this start.
+    assert s.state.stale == (source is not None)
+    s.feed("LIVE", 30, started_at=start)
+    assert not s.state.stale
+    s.offline()
+    assert s.worker() and not s.worker()
+    assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
+
+
+# OFFLINE/REPLAY open a pending end; its two-read recheck is covered above.
+@pytest.mark.parametrize("interruption", ["UNKNOWN", "other"])
+def test_session_start_after_replay_needs_consecutive_matching_reads(
+    scenario, interruption
+):
+    s = scenario
+    start = 1020
+    live_session(s, start)
+    replay_during_session(s, "RSS", start)
+    s.restart(s.c.offline_restart_grace_seconds + 1)
+    s.feed("LIVE", 30, started_at=start)
+    if interruption == "other":
+        s.feed("LIVE", 30)  # Live, but without this session's start.
+    else:
+        s.feed("UNKNOWN", 30)
+    s.feed("LIVE", 30, started_at=start)
+    assert s.state.stale
+    s.feed("LIVE", 30, started_at=start)
+    assert not s.state.stale
+
+
+def test_session_start_after_replay_needs_spaced_reads(scenario):
+    s = scenario
+    start = 1020
+    live_session(s, start)
+    replay_during_session(s, "RSS", start)
+    s.restart(s.c.offline_restart_grace_seconds + 1)
+    s.feed("LIVE", 30, started_at=start)
+    s.feed("LIVE", s.c.live_confirm_gap_seconds - 1, started_at=start)
+    assert s.state.stale
+    s.feed("LIVE", 1, started_at=start)
+    assert not s.state.stale
+    s.restart(s.c.offline_restart_grace_seconds + 1)
+    s.feed("LIVE", 30, started_at=start)
+    s.feed("LIVE", s.state.evidence_gap_limit + 1, started_at=start)
+    assert s.state.stale
+    s.feed("LIVE", 30, started_at=start)
+    assert not s.state.stale
+
+
+@pytest.mark.parametrize("first", [REPLAY_START, 1020])
+def test_pending_end_resume_restores_identity_only_if_both_reads_match(scenario, first):
+    s = scenario
+    start = 1020
+    live_session(s, start)
+    replay_during_session(s, "RSS", start)
+    s.restart(s.c.offline_restart_grace_seconds + 1)
+    s.feed("OFFLINE", 30)
+    assert s.state.phase == "OFFLINE_CANDIDATE"
+    s.feed("LIVE", 30, started_at=first)
+    s.feed("LIVE", 10, started_at=start)
+    # Either pair confirms the resume; only a matching pair confirms the session.
+    assert s.state.phase == "LIVE_CONFIRMED"
+    assert s.state.stale == (first != start)
+    s.offline()
+    s.worker()
+    expected = "SENT" if first == start else "EXPIRED"
+    assert s.events() == [("LIVE", "SENT"), ("OFFLINE", expected)]
+
+
+def test_session_identity_restores_with_long_live_confirm_gap(scenario):
+    s = scenario
+    gap = 90  # Longer than the 68 s evidence gap limit of the default polling.
+    s.restart(live_confirm_gap_seconds=gap)
+    for _ in range(4):  # Routine 30 s polls; only reads 90 s apart pair up.
+        s.feed("OFFLINE", 30)
+    start = int(s.t)
+    for _ in range(4):
+        s.feed("LIVE", 30, started_at=start)
+    assert s.worker()
+    replay_during_session(s, "RSS", start)
+    s.restart(s.c.offline_restart_grace_seconds + 1)
+    for _ in range(3):
+        s.feed("LIVE", 30, started_at=start)
+        assert s.state.stale
+    s.feed("LIVE", 30, started_at=start)  # 90 s after the first matching read.
+    assert not s.state.stale
+    s.offline()
+    s.worker()
+    assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
+
+
+def test_start_correction_confirms_with_long_live_confirm_gap(scenario):
+    s = scenario
+    gap = 90
+    s.restart(live_confirm_gap_seconds=gap)
+    for _ in range(4):
+        s.feed("REPLAY", 30, started_at=REPLAY_START)
+    assert s.state.confirmed == "OFFLINE"
+    for _ in range(6):  # Two guarded reads, then a pair 90 s apart.
+        s.feed("LIVE", 30, started_at=REPLAY_START)
+    assert s.worker() and s.state.session_started_at is None
+    corrected = int(s.t) - 30
+    for _ in range(4):  # The fourth read is 90 s after the first.
+        assert s.state.session_started_at is None
+        s.feed("LIVE", 30, started_at=corrected)
+    assert s.state.session_started_at == corrected
+    assert s.events() == [("LIVE", "SENT")]
+
+
+OWN, OTHER = "own", "other"
+
+
+@pytest.mark.parametrize(
+    "gap,reads,restored",
+    [
+        # A contradicting read between two matching ones breaks the run.
+        (10, [(30, OWN), (5, OTHER), (5, OWN)], False),
+        # The matching read that ends the pending end still starts a run.
+        (10, [(30, OTHER), (10, OWN), (30, OWN)], True),
+        # No sampling for longer than the evidence gap limit breaks the run.
+        (90, [(30, OWN), (90, OWN)], False),
+    ],
+)
+def test_pending_end_and_live_reads_share_one_identity_run(
+    scenario, gap, reads, restored
+):
+    s = scenario
+    start = 1020
+    s.restart(live_confirm_gap_seconds=gap)
+    step = min(gap, 30)  # Routine polls, or the faster confirmation recheck.
+    reads_per_pair = gap // step + 1  # The last read is `gap` after the first.
+    for _ in range(reads_per_pair):
+        s.feed("OFFLINE", step)
+    assert s.state.confirmed == "OFFLINE"
+    for _ in range(reads_per_pair):
+        s.feed("LIVE", step, started_at=start)
+    assert s.state.confirmed == "LIVE_CONFIRMED"
+    assert s.worker()
+    replay_during_session(s, "RSS", start)
+    s.restart(s.c.offline_restart_grace_seconds + 1)
+    s.feed("OFFLINE", 30)
+    assert s.state.phase == "OFFLINE_CANDIDATE"
+    for delta, which in reads:
+        s.feed("LIVE", delta, started_at=start if which == OWN else REPLAY_START)
+    assert s.state.phase == "LIVE_CONFIRMED"
+    assert s.state.stale == (not restored)
+    s.offline()
+    s.worker()
+    expected = "SENT" if restored else "EXPIRED"
+    assert s.events() == [("LIVE", "SENT"), ("OFFLINE", expected)]
+
+
 # Starts missed while the service was down
 
 
@@ -633,6 +817,27 @@ def test_migration_backfills_first_start(scenario):
         s.db.execute("ALTER TABLE sessions DROP COLUMN first_started_at")
     # status is read-only and can run before the first upgraded service start.
     assert room_status(s.db, s.c)["latest"][0]["platform_start_to_accept_seconds"] == 30
+    initialize(s.db, s.c)
+    row = s.db.execute("SELECT first_started_at FROM sessions WHERE id=1").fetchone()
+    assert row[0] == 1020
+
+
+def test_interrupted_first_start_migration_is_retried(scenario):
+    import sqlite3
+
+    s = scenario
+    live_session(s, start=1020)
+    with s.db:
+        s.db.execute("ALTER TABLE sessions DROP COLUMN first_started_at")
+        # Stands in for a crash after the column is added, before the backfill.
+        s.db.execute("""CREATE TRIGGER interrupt BEFORE UPDATE ON sessions
+                        BEGIN SELECT RAISE(ABORT, 'interrupted'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="interrupted"):
+        initialize(s.db, s.c)
+    columns = {r[1] for r in s.db.execute("PRAGMA table_info(sessions)")}
+    assert "first_started_at" not in columns  # Rolled back with the backfill.
+    with s.db:
+        s.db.execute("DROP TRIGGER interrupt")
     initialize(s.db, s.c)
     row = s.db.execute("SELECT first_started_at FROM sessions WHERE id=1").fetchone()
     assert row[0] == 1020

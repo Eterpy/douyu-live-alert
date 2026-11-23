@@ -9,6 +9,7 @@ from email.message import Message
 from http.client import HTTPException, IncompleteRead
 from io import BytesIO
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from aiodouyu import ApiError, web
@@ -109,6 +110,10 @@ class ResponseTooLarge(ValueError):
     """The upstream HTTP body exceeds the input limit."""
 
 
+class InsecureRedirect(ValueError):
+    """A redirect would leave HTTPS; its response must not become evidence."""
+
+
 class _SkipRedirectBody(HTTPRedirectHandler):
     def http_error_302(self, req, fp, code, msg, headers):
         # urllib normally drains the entire redirect body before following Location.
@@ -117,6 +122,13 @@ class _SkipRedirectBody(HTTPRedirectHandler):
         return super().http_error_302(req, BytesIO(), code, msg, headers)
 
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib also follows http:// and ftp://; status is only verified over HTTPS.
+        # newurl is already resolved against the request URL here.
+        if urlsplit(newurl).scheme.lower() != "https":
+            raise InsecureRedirect()
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _read_text(url: str, timeout: float) -> str:

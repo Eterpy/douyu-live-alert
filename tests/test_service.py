@@ -179,6 +179,55 @@ def test_sampler_prioritizes_rechecking_live_during_pending_end(scenario):
     assert s.events() == [("LIVE", "SENT")]
 
 
+@pytest.mark.parametrize("hint", [None, "status_hint", "possible_live"])
+def test_live_hint_during_recheck_keeps_matching_session_evidence(scenario, hint):
+    s = scenario
+    session_start = 1020
+    s.baseline()
+    s.feed("LIVE", 30, started_at=session_start)
+    s.feed("LIVE", 10, started_at=session_start)
+    assert s.worker()
+    s.t += 5
+    Service(s.c, s.db, None, lambda: s.t, lambda: s.t).event("replay")
+    s.t += s.c.offline_restart_grace_seconds + 1  # Long outage: notices are stale.
+    start = s.t
+    reads = []
+
+    class Room:
+        async def sample(self):
+            reads.append(s.t - start)
+            if len(reads) == 1:
+                return Observation("OFFLINE", "fixture", s.t, s.t, s.t)
+            if len(reads) == 3:
+                # Stop by count, so a broken fast recheck still ends the loop
+                # and fails the timing assertion below.
+                if hint is not None:
+                    service.event(hint)  # Arrives while this request is in flight.
+                service.stop.set()
+            return Observation(
+                "LIVE", "fixture", s.t, s.t, s.t, started_at=session_start
+            )
+
+    service = Service(s.c, s.db, Room(), lambda: s.t, lambda: s.t)
+    s.state = service.state
+    assert s.state.stale
+
+    async def wait(delay):
+        s.t += delay
+
+    with (
+        patch.object(service, "wait_for_sample", wait),
+        patch("random.uniform", return_value=1),
+    ):
+        asyncio.run(service.sample_loop())
+    assert reads == [0, 30, 40]
+    # Both HTTP reads carry the session's start; a live hint does not contradict.
+    assert s.state.phase == "LIVE_CONFIRMED" and not s.state.stale
+    s.offline()
+    s.worker()
+    assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
+
+
 def test_replay_burst_preserves_nonlive_baseline_and_cancels_live_candidate(scenario):
     s = scenario
     service = Service(s.c, s.db, None, lambda: s.t, lambda: s.t)

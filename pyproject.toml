@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "douyu-live-alert"
-version = "2.0.2"
+version = "2.1.0"
 description = "Email alerts when Douyu streamers go live or offline, with HTTP-verified, de-duplicated notifications"
 readme = "README.md"
 license = "MIT"

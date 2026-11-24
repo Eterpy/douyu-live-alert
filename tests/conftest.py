@@ -70,6 +70,16 @@ class Scenario:
         return process_one(self.c, transport, lambda: self.t)
 
 
+def text(msg) -> str:
+    """The plain-text part, also the whole body of text-only messages."""
+    return msg.get_body(preferencelist=("plain",)).get_content()
+
+
+def html(msg) -> str | None:
+    part = msg.get_body(preferencelist=("html",))
+    return None if part is None else part.get_content()
+
+
 @pytest.fixture
 def scenario(tmp_path):
     c = config(data_dir=str(tmp_path), notification_mode="send")

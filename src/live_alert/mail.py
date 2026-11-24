@@ -17,7 +17,12 @@ from .storage import audit, connect
 
 
 def message(
-    c: Config, recipient: str, subject: str, body: str, message_id: str | None = None
+    c: Config,
+    recipient: str,
+    subject: str,
+    body: str,
+    message_id: str | None = None,
+    html: str | None = None,
 ) -> EmailMessage:
     msg = EmailMessage(policy=SMTP)
     sender = Address(c.smtp_from_name, addr_spec=c.smtp_from_address)
@@ -28,6 +33,9 @@ def message(
     msg["Date"] = format_datetime(datetime.now(ZoneInfo("Asia/Shanghai")))
     msg["Message-ID"] = message_id or make_msgid(domain=sender.domain)
     msg.set_content(body, cte="quoted-printable")
+    if html:
+        # multipart/alternative: clients that cannot show HTML use the text part.
+        msg.add_alternative(html, subtype="html", cte="quoted-printable")
     return msg
 
 
@@ -275,6 +283,7 @@ def process_one(
             chosen["body"],
             f"<{chosen['kind'].lower()}.{chosen['session_id']}.{chosen['id']}"
             f".{int(chosen['created'] * 1000)}@{domain}>",
+            chosen["html"],
         )
         try:
             state, reason = transport(c, msg, before_data)

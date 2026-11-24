@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import datetime
 
 import pytest
+from conftest import text
 
 from live_alert.douyu import Observation
 
@@ -22,14 +23,14 @@ def test_full_cycle_two_template_contents_and_order(scenario):
     assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
     start, end = s.sent
     assert start["Subject"] == "🎙️ 测试主播 开播啦～"
-    assert start.get_content().splitlines() == [
+    assert text(start).splitlines() == [
         "📣 直播间有新动静啦～",
         "直播间：https://www.douyu.com/10001",
         "标题: 灵狐，为我引路！",
         "本场确认开播时间：2026-11-22 20:20:32",
     ]
     assert end["Subject"] == "🌙 测试主播 下播休息啦～"
-    assert end.get_content().splitlines() == [
+    assert text(end).splitlines() == [
         "🌙 直播间安静下来啦，记录放在这里～",
         "直播间：https://www.douyu.com/10001",
         "标题: 灵狐，为我引路！",

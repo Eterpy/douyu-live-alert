@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from .config import Config
 from .douyu import CLOCK_SKEW_SECONDS, Observation, clean
+from .mail_html import live_html, offline_html
 from .storage import audit
 
 # aiodouyu's LiveStatusMonitor defers conflicting live snapshots this long after a replay.
@@ -621,6 +622,14 @@ class MonitorState:
             f"标题: {title or '未获取'}\n"
             f"本场确认开播时间：{mail_time(o.utc)}"
         )
+        html = live_html(
+            subject=subject,
+            name=name,
+            title=title,
+            room_id=c.room_id,
+            confirmed_at=mail_time(o.utc),
+            brand=c.smtp_from_name,
+        )
         state = (
             "SUPPRESSED_BASELINE"
             if silent
@@ -628,7 +637,7 @@ class MonitorState:
             if restored
             else self._initial_delivery(c.notify_live)
         )
-        self._enqueue("LIVE", state, subject, body, o.utc)
+        self._enqueue("LIVE", state, subject, body, o.utc, html)
 
     def _initial_delivery(self, enabled: bool) -> str:
         if not enabled:
@@ -683,18 +692,35 @@ class MonitorState:
             f"确认下播时间：{mail_time(o.utc)}\n"
             f"直播时长：{length}"
         )
-        self._enqueue("OFFLINE", state, subject, body, o.utc)
+        ended = datetime.fromtimestamp(o.utc, SHANGHAI)
+        html = offline_html(
+            subject=subject,
+            name=row["name"],
+            title=row["title"],
+            room_id=c.room_id,
+            date=ended.strftime("%Y-%m-%d"),
+            time=ended.strftime("%H:%M:%S"),
+            duration=length,
+            brand=c.smtp_from_name,
+        )
+        self._enqueue("OFFLINE", state, subject, body, o.utc, html)
         self.session, self.window, self.stale = None, None, False
         self.gap_reference = None
         self.offline_first = None
         self.confirmed = self.phase = "OFFLINE"
 
     def _enqueue(
-        self, kind: str, state: str, subject: str, body: str, now: float
+        self,
+        kind: str,
+        state: str,
+        subject: str,
+        body: str,
+        now: float,
+        html: str | None = None,
     ) -> None:
         self.db.execute(
             """INSERT INTO outbox(session_id,kind,recipient,state,reason,subject,body,
-                        created,next_try) VALUES(?,?,?,?,?,?,?,?,?)""",
+                        html,created,next_try) VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (
                 self.session,
                 kind,
@@ -703,6 +729,7 @@ class MonitorState:
                 state,
                 subject,
                 body,
+                html,
                 now,
                 now,
             ),

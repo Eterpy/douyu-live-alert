@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 from aiodouyu import web
-from conftest import config
+from conftest import config, text
 
 from live_alert.douyu import Douyu, Observation
 from live_alert.service import Service, loop_watchdog
@@ -176,7 +176,7 @@ def test_room_63136_reused_start_never_dates_or_duplicates_the_session(
     s.offline()
     assert s.worker() and not s.worker()
     assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
-    assert "直播时长：未知" in s.sent[-1].get_content()
+    assert "直播时长：未知" in text(s.sent[-1])
 
 
 def test_distinct_later_broadcast_after_reused_start_still_rotates(scenario):
@@ -772,7 +772,7 @@ def test_offline_mail_duration_uses_original_start_after_resume(scenario):
         s.feed("LIVE", 600, started_at=resumed)
     s.offline()
     assert s.worker()
-    body = s.sent[-1].get_content()
+    body = text(s.sent[-1])
     # 1020 -> first offline sample 60 s after the last live one: 63 minutes.
     assert body.splitlines()[-1] == "直播时长：约 1 小时 3 分钟"
 
@@ -784,7 +784,7 @@ def test_offline_mail_duration_unknown_without_trusted_start(scenario):
     s.worker()
     s.offline()
     assert s.worker()
-    assert "直播时长：未知" in s.sent[-1].get_content()
+    assert "直播时长：未知" in text(s.sent[-1])
 
 
 @pytest.mark.parametrize("start", [1020, None])
@@ -1042,7 +1042,7 @@ def test_unstorable_title_characters_are_dropped(scenario):
     s.feed("LIVE", 30, title=o.title)
     s.feed("LIVE", 10, title=o.title)
     assert s.worker()
-    assert "标题: 正常标题" in s.sent[-1].get_content().splitlines()
+    assert "标题: 正常标题" in text(s.sent[-1]).splitlines()
     # Defence in depth: raw text reaching the state machine is cleaned as well.
     s.offline()
     s.feed("LIVE", 30, title=title, owner="主播\ud800")

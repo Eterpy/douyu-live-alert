@@ -105,6 +105,9 @@ def migrate(db: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             db.execute(f"ALTER TABLE monitor ADD COLUMN {name} {ddl}")
+    # Optional HTML part. Notices queued before it existed are sent as plain text.
+    if "html" not in {r[1] for r in db.execute("PRAGMA table_info(outbox)")}:
+        db.execute("ALTER TABLE outbox ADD COLUMN html TEXT")
     # started_at follows a resumed broadcast; the original start dates the duration.
     # Legacy sqlite3 transaction control autocommits DDL. Open the transaction
     # explicitly so the column and its backfill commit together: a column left

@@ -7,7 +7,7 @@ from contextlib import closing
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from conftest import ROOM, Scenario, config
+from conftest import ROOM, Scenario, config, text
 
 from live_alert import service as service_module
 from live_alert.cli import main
@@ -78,11 +78,11 @@ def test_mail_name_prefers_configured_then_platform(
     s.feed("LIVE", 10, owner=owner)
     assert s.worker()
     assert s.sent[-1]["Subject"] == f"🎙️ {expected} 开播啦～"
-    assert "标题: 未获取" in s.sent[-1].get_content().splitlines()
+    assert "标题: 未获取" in text(s.sent[-1]).splitlines()
     s.offline()
     assert s.worker()
     assert s.sent[-1]["Subject"] == f"🌙 {expected} 下播休息啦～"
-    assert "标题: 未获取" in s.sent[-1].get_content().splitlines()
+    assert "标题: 未获取" in text(s.sent[-1]).splitlines()
 
 
 class FakeDouyu:

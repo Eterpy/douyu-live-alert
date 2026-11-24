@@ -102,6 +102,7 @@ def migrate(db: sqlite3.Connection) -> None:
         ("offline_first", "REAL"),
         ("restored_at", "REAL"),
         ("gap_reference", "REAL"),
+        ("session_seen", "REAL"),
     ):
         if name not in columns:
             db.execute(f"ALTER TABLE monitor ADD COLUMN {name} {ddl}")

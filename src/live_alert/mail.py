@@ -122,7 +122,14 @@ def deliver(
                 client.close()
 
 
-def eligibility(db: sqlite3.Connection, c: Config, row: sqlite3.Row, now: float) -> str:
+def eligibility(
+    db: sqlite3.Connection,
+    c: Config,
+    row: sqlite3.Row,
+    now: float,
+    evidence_age: float | None = None,
+) -> str:
+    """evidence_age: monotonic seconds since the newest observation, if known."""
     session = db.execute(
         "SELECT * FROM sessions WHERE id=?", (row["session_id"],)
     ).fetchone()
@@ -131,9 +138,13 @@ def eligibility(db: sqlite3.Connection, c: Config, row: sqlite3.Row, now: float)
         "SELECT state,utc FROM observations WHERE room=? ORDER BY rowid DESC LIMIT 1",
         (c.room_id,),
     ).fetchone()
-    if not 0 <= now - row["created"] <= c.max_notification_age_seconds:
+    age = now - row["created"]
+    # A wall clock stepped back defers the notice until the clock catches up and
+    # fresh evidence is checked again. A step back larger than the notice age
+    # expires it: the real delay would then exceed twice that age.
+    if not -c.max_notification_age_seconds <= age <= c.max_notification_age_seconds:
         return "EXPIRED"
-    if not monitor["mail_ready"] or latest is None:
+    if age < 0 or not monitor["mail_ready"] or latest is None:
         return "WAIT"
     if row["kind"] == "LIVE":
         if session["ended"] is not None or monitor["session_id"] != row["session_id"]:
@@ -154,7 +165,11 @@ def eligibility(db: sqlite3.Connection, c: Config, row: sqlite3.Row, now: float)
         else c.poll_interval_seconds + c.http_timeout_seconds + 5
     )
     expected = ("LIVE",) if row["kind"] == "LIVE" else ("OFFLINE", "REPLAY")
-    if latest["state"] not in expected or not 0 <= now - latest["utc"] <= limit:
+    age = now - latest["utc"]
+    if evidence_age is not None:
+        # A wall clock stepped back must not make old evidence look fresh.
+        age = max(age, evidence_age)
+    if latest["state"] not in expected or not 0 <= age <= limit:
         return "WAIT"
     return "READY"
 
@@ -164,6 +179,7 @@ def process_one(
     transport=None,
     clock: Callable[[], float] = time.time,
     stopping: Callable[[], bool] = lambda: False,
+    evidence_age: Callable[[], float | None] = lambda: None,
 ) -> bool:
     # A call queued before shutdown must not start a new SMTP attempt.
     if c.notification_mode != "send" or stopping():
@@ -235,7 +251,7 @@ def process_one(
                             f"paired_live_{prior_state}",
                         )
                         continue
-                eligible = eligibility(db, c, row, now)
+                eligible = eligibility(db, c, row, now, evidence_age())
                 if eligible == "EXPIRED":
                     _update(db, c, row, "EXPIRED", "obsolete_state")
                     continue
@@ -261,7 +277,7 @@ def process_one(
         def before_data() -> None:
             with db:
                 db.execute("BEGIN IMMEDIATE")
-                eligible = eligibility(db, c, chosen, clock())
+                eligible = eligibility(db, c, chosen, clock(), evidence_age())
                 if eligible == "WAIT":
                     raise Deferred()
                 if eligible != "READY":

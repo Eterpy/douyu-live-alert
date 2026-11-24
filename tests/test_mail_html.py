@@ -73,8 +73,10 @@ def test_html_without_title_or_trusted_start(scenario):
     live, offline = broadcast(scenario, title="", start_offset=None)
     assert "未获取" in html(live) and "斗鱼房间" not in html(live)
     page = html(offline)
-    assert "未知" in page and "缺少可信开播时间" in page
-    assert "测试主播 已下播</div>" in page
+    assert "直播时长：约 3 分钟" in text(offline)
+    assert ">约 3 分钟</div>" in page
+    assert "测试主播 已下播，本场约 3 分钟" in page
+    assert "估算" not in page and "缺少可信开播时间" not in page
 
 
 def test_configured_sender_name_is_escaped_in_footer(scenario):

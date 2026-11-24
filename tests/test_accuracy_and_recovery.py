@@ -176,7 +176,7 @@ def test_room_63136_reused_start_never_dates_or_duplicates_the_session(
     s.offline()
     assert s.worker() and not s.worker()
     assert s.events() == [("LIVE", "SENT"), ("OFFLINE", "SENT")]
-    assert "直播时长：未知" in text(s.sent[-1])
+    assert "直播时长：约 4 分钟" in text(s.sent[-1])
 
 
 def test_distinct_later_broadcast_after_reused_start_still_rotates(scenario):
@@ -777,14 +777,344 @@ def test_offline_mail_duration_uses_original_start_after_resume(scenario):
     assert body.splitlines()[-1] == "直播时长：约 1 小时 3 分钟"
 
 
-def test_offline_mail_duration_unknown_without_trusted_start(scenario):
+def test_offline_duration_matches_confirmation_times_printed_to_seconds(scenario):
+    s = scenario
+    s.t += 0.75
+    s.baseline()
+    s.live()
+    assert s.worker()
+    s.feed("LIVE", 29.5)
+    s.offline()
+    assert s.worker()
+    # The displayed timestamps differ by 3 min 30 s, including offline confirmation.
+    assert "直播时长：约 4 分钟" in text(s.sent[-1])
+
+
+@pytest.mark.parametrize("trusted_start", [False, True])
+def test_baseline_session_duration_needs_platform_start(scenario, trusted_start):
+    from conftest import html
+
+    s = scenario
+    s.restart(notify_offline_for_baseline_live=True, offline_requires_live_email=False)
+    s.t = 100_000
+    # Already live at first start; the session began long before confirmation.
+    start = int(s.t) - 3 * 3600 if trusted_start else None
+    s.feed("LIVE", started_at=start, owner="测试主播")
+    s.feed("LIVE", 10, started_at=start, owner="测试主播")
+    assert s.events() == [("LIVE", "SUPPRESSED_BASELINE")]
+    for _ in range(20):
+        s.feed("LIVE", 30, started_at=start)
+    s.offline()
+    assert s.worker()
+    assert s.events() == [("LIVE", "SUPPRESSED_BASELINE"), ("OFFLINE", "SENT")]
+    msg = s.sent[-1]
+    page = html(msg)
+    if trusted_start:
+        assert "直播时长：约 3 小时 11 分钟" in text(msg)
+        assert "按开播时间估算" in page
+    else:
+        # The confirmation time is only when monitoring began, not the start.
+        assert "直播时长：未知" in text(msg)
+        assert ">未知</div>" in page and "缺少可信开播时间" in page
+        assert 'opacity:0;">测试主播 已下播</div>' in page  # Inbox preview line.
+
+
+def test_restored_session_without_platform_start_keeps_unknown_duration(scenario):
     s = scenario
     s.baseline()
     s.live()
-    s.worker()
+    with s.db:
+        s.db.execute("UPDATE sessions SET restored=1")
+    s.offline()
+    body = s.db.execute("SELECT body FROM outbox WHERE kind='OFFLINE'").fetchone()[0]
+    assert s.events()[-1] == ("OFFLINE", "SUPPRESSED_RESTORE")
+    assert body.splitlines()[-1] == "直播时长：未知"
+
+
+@pytest.mark.parametrize("trusted_a", [False, True])
+@pytest.mark.parametrize("offline_reads", [1, 2])
+def test_long_outage_cannot_pass_a_new_broadcast_as_a_resume(
+    scenario, trusted_a, offline_reads
+):
+    s = scenario
+    s.baseline()
+    a_start = int(s.t) + 20 if trusted_a else None
+    s.feed("LIVE", 30, started_at=a_start, title="A 场")
+    s.feed("LIVE", 10, started_at=a_start, title="A 场")
+    assert s.worker()
+    s.restart(3 * 86400)  # Down for three days; A ended at an unknown time.
+    for _ in range(offline_reads):
+        # The first offline read follows the outage, not A's last live read.
+        s.feed("OFFLINE", 30)
+    b_start = int(s.t) - 60
+    s.feed("LIVE", 30, started_at=b_start, title="B 场")
+    s.feed("LIVE", 10, started_at=b_start, title="B 场")
+    assert s.state.session == 2  # Not merged into A.
+    assert s.worker()
     s.offline()
     assert s.worker()
-    assert "直播时长：未知" in text(s.sent[-1])
+    assert s.events() == [
+        ("LIVE", "SENT"),
+        ("OFFLINE", "SUPPRESSED_SESSION_CHANGE"),
+        ("LIVE", "SENT"),
+        ("OFFLINE", "SENT"),
+    ]
+    body = text(s.sent[-1]).splitlines()
+    assert "标题: B 场" in body and "小时" not in body[-1]
+
+
+def test_offline_duration_uses_the_seconds_shown_in_both_notices(scenario):
+    from live_alert.state import mail_time
+
+    s = scenario
+    s.t = 1_000_000.0
+    s.baseline()
+    s.feed("LIVE", 30)
+    # Rounding to microseconds would show this confirmation one second later.
+    s.feed("LIVE", 10.9999996)
+    assert s.state.confirmed == "LIVE_CONFIRMED"
+    assert s.worker()
+    s.feed("LIVE", 29.0000004)
+    s.offline()
+    assert s.worker()
+    live, offline = (text(m).splitlines() for m in s.sent)
+    shown = [line.split("：")[1] for line in (live[-1], offline[-2])]
+    assert shown == [mail_time(1_000_050), mail_time(1_000_260)]
+    assert offline[-1] == f"直播时长：约 {duration(210)}"  # 3 min 30 s as displayed.
+
+
+@pytest.mark.parametrize("trusted_a", [False, True])
+def test_new_broadcast_read_before_offline_cannot_bridge_an_outage(scenario, trusted_a):
+    s = scenario
+    s.baseline()
+    a_start = int(s.t) + 20 if trusted_a else None
+    s.feed("LIVE", 30, started_at=a_start, title="A 场")
+    s.feed("LIVE", 10, started_at=a_start, title="A 场")
+    assert s.worker()
+    s.restart(3 * 86400)
+    b_start = int(s.t) - 60
+    # B's first read is no evidence of A, so the offline read after it still
+    # follows the outage rather than A's last read.
+    s.feed("LIVE", 1, started_at=b_start, title="B 场")
+    s.feed("OFFLINE", 30)
+    s.feed("LIVE", 30, started_at=b_start, title="B 场")
+    s.feed("LIVE", 10, started_at=b_start, title="B 场")
+    assert s.state.session == 2
+    assert s.worker()
+    for _ in range(3):
+        s.feed("LIVE", 30, started_at=b_start, title="B 场")
+    s.offline()
+    assert s.worker()
+    assert s.events() == [
+        ("LIVE", "SENT"),
+        ("OFFLINE", "SUPPRESSED_SESSION_CHANGE"),
+        ("LIVE", "SENT"),
+        ("OFFLINE", "SENT"),
+    ]
+    body = text(s.sent[-1]).splitlines()
+    assert "标题: B 场" in body and "小时" not in body[-1]
+
+
+@pytest.mark.parametrize("outage", [10, 3 * 86400])
+def test_own_start_after_outage_still_allows_a_brief_drop_to_resume(scenario, outage):
+    s = scenario
+    start = 1020
+    live_session(s, start)
+    s.restart(outage)
+    s.feed("LIVE", 1, started_at=start)  # A's own start: this is still A.
+    for _ in range(3):
+        s.feed("LIVE", 30, started_at=start)
+    s.feed("OFFLINE", 30)
+    s.feed("OFFLINE", 30)
+    resumed = int(s.t) + 25
+    s.feed("LIVE", 30, started_at=resumed)
+    s.feed("LIVE", 10, started_at=resumed)
+    assert s.state.session == 1 and s.state.session_started_at == resumed
+    assert s.events() == [("LIVE", "SENT")]
+
+
+def test_short_restart_keeps_undated_session_resumable(scenario):
+    s = scenario
+    s.baseline()
+    s.live()  # No platform start.
+    assert s.worker()
+    s.restart(10)  # A deployment restart.
+    for _ in range(4):
+        s.feed("LIVE", 30)
+    s.feed("OFFLINE", 30)
+    s.feed("OFFLINE", 30)
+    resumed = int(s.t) + 25
+    s.feed("LIVE", 30, started_at=resumed)
+    s.feed("LIVE", 10, started_at=resumed)
+    assert s.state.session == 1
+    assert s.events() == [("LIVE", "SENT")]
+
+
+def test_session_upgraded_mid_broadcast_stays_resumable(scenario):
+    s = scenario
+    s.baseline()
+    s.live()
+    assert s.worker()
+    with s.db:  # As left by 2.1.0, which had no session_seen column.
+        s.db.execute("UPDATE monitor SET session_seen=NULL")
+    s.restart(10)
+    assert s.state.session_seen == s.state.last_valid
+    s.feed("OFFLINE", 30)
+    resumed = int(s.t) + 25
+    s.feed("LIVE", 30, started_at=resumed)
+    s.feed("LIVE", 10, started_at=resumed)
+    assert s.state.session == 1
+    assert s.events() == [("LIVE", "SENT")]
+
+
+def b_after_outage(s, before_b):
+    """A (with a trusted start) ends during a three-day outage; B starts after it."""
+    a_start = 1020
+    live_session(s, a_start)
+    s.restart(3 * 86400)
+    b_start = int(s.t) - 60
+    before_b(a_start, b_start)
+    s.feed("LIVE", 30, started_at=b_start, title="B 场")
+    s.feed("LIVE", 10, started_at=b_start, title="B 场")
+    assert s.state.session == 2  # B is a new session, not a resume of A.
+    assert s.worker()
+    for _ in range(3):
+        s.feed("LIVE", 30, started_at=b_start, title="B 场")
+    s.offline()
+    assert s.worker()
+    assert s.events() == [
+        ("LIVE", "SENT"),
+        ("OFFLINE", "SUPPRESSED_SESSION_CHANGE"),
+        ("LIVE", "SENT"),
+        ("OFFLINE", "SENT"),
+    ]
+    body = text(s.sent[-1]).splitlines()
+    assert "标题: B 场" in body and "小时" not in body[-1]
+
+
+def test_replay_with_old_start_cannot_revive_an_ended_session(scenario):
+    s = scenario
+
+    def before_b(a_start, b_start):
+        # A replay carrying A's start, then a live read without any start: neither
+        # shows that A is still on air after the outage.
+        s.feed("REPLAY", 1, started_at=a_start)
+        s.feed("LIVE", 30)
+        s.feed("OFFLINE", 30)
+
+    b_after_outage(s, before_b)
+
+
+@pytest.mark.parametrize("read_before_upgrade", ["new_session", "offline"])
+def test_upgrade_after_outage_keeps_evidence_from_before_the_outage(
+    scenario, read_before_upgrade
+):
+    s = scenario
+
+    def before_b(a_start, b_start):
+        # 2.1.0 took one read after the outage, then 2.1.1 took over the database.
+        if read_before_upgrade == "new_session":
+            s.feed("LIVE", 1, started_at=b_start, title="B 场")
+        else:
+            s.feed("OFFLINE", 1)
+        with s.db:  # 2.1.0 had no session_seen; it anchored on the offline read.
+            s.db.execute(
+                "UPDATE monitor SET session_seen=NULL, offline_first=?",
+                (s.t if read_before_upgrade == "offline" else None,),
+            )
+        s.restart(5)
+        if read_before_upgrade == "new_session":
+            s.feed("OFFLINE", 30)
+
+    b_after_outage(s, before_b)
+
+
+def test_undated_session_after_long_gap_treats_new_start_as_new_session(scenario):
+    s = scenario
+    s.baseline()
+    s.live()
+    assert s.worker()
+    s.restart(3 * 86400)
+    for _ in range(4):
+        s.feed("LIVE", 30)  # Live, but nothing shows this is still the same session.
+    s.feed("OFFLINE", 30)
+    s.feed("OFFLINE", 30)
+    new_start = int(s.t) + 25
+    s.feed("LIVE", 30, started_at=new_start)
+    s.feed("LIVE", 10, started_at=new_start)
+    # Prefer a possibly repeated notice over a missed one.
+    assert s.state.session == 2
+    assert s.events()[-2:] == [
+        ("OFFLINE", "SUPPRESSED_SESSION_CHANGE"),
+        ("LIVE", "PENDING"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "notice,expected",
+    [
+        # 2.1.0 rounded to microseconds first and printed the next second.
+        ("本场确认开播时间：{shown}", 209),
+        # 2.0.1 printed an ISO time.
+        ("确认开播时间：{iso}", 209),
+        # Unreadable or unrelated text falls back to the recorded confirmation.
+        ("本场确认开播时间：未知", 210),
+        ("本场确认开播时间：2001-01-01 00:00:00", 210),
+    ],
+)
+def test_offline_duration_reads_time_shown_by_earlier_live_notice(
+    scenario, notice, expected
+):
+    from live_alert.state import local, mail_time
+
+    s = scenario
+    s.t = 1_000_000.0
+    s.baseline()
+    s.feed("LIVE", 30)
+    s.feed("LIVE", 10.9999996)  # Confirmed at 1_000_050.9999996.
+    assert s.worker()
+    line = notice.format(shown=mail_time(1_000_051), iso=local(1_000_051))
+    with s.db:
+        s.db.execute(
+            "UPDATE outbox SET body=? WHERE kind='LIVE'",
+            (f"📣 直播间有新动静啦～\n标题: 未获取\n{line}",),
+        )
+    s.feed("LIVE", 29.0000004)
+    s.offline()  # Confirmed at 1_000_260.
+    assert s.worker()
+    assert text(s.sent[-1]).splitlines()[-1] == f"直播时长：约 {duration(expected)}"
+
+
+@pytest.mark.parametrize("trusted_start", [False, True])
+def test_wall_clock_stepped_back_leaves_duration_unknown(scenario, trusted_start):
+    s = scenario
+    s.baseline()
+    start = int(s.t) + 20 if trusted_start else None
+    s.feed("LIVE", 30, started_at=start, owner="测试主播")
+    s.feed("LIVE", 10, started_at=start, owner="测试主播")
+    assert s.worker()
+    # The host clock steps back 5 minutes; the monotonic clock keeps counting.
+    for state, delta in (
+        ("LIVE", 30),
+        ("OFFLINE", 60),
+        ("REPLAY", 60),
+        ("OFFLINE", 60),
+    ):
+        s.t += delta
+        started = start if state == "LIVE" else None
+        o = Observation(state, "fixture", s.t, s.t, s.t - 300, started_at=started)
+        s.state.observe(o, "timer", s.t)
+    assert s.state.confirmed == "OFFLINE"
+    live, offline = (
+        tuple(r) for r in s.db.execute("SELECT body, html FROM outbox ORDER BY id")
+    )
+    # On the stepped-back clock, offline is confirmed "before" the live notice.
+    live_at = live[0].splitlines()[-1].split("：")[1]
+    offline_at = offline[0].splitlines()[-2].split("：")[1]
+    assert offline_at < live_at
+    assert offline[0].splitlines()[-1] == "直播时长：未知"  # Not "约 0 分钟".
+    assert ">未知</div>" in offline[1] and "时间记录异常，无法计算" in offline[1]
+    assert 'opacity:0;">测试主播 已下播</div>' in offline[1]
 
 
 @pytest.mark.parametrize("start", [1020, None])

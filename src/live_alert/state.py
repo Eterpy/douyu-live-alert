@@ -1,4 +1,5 @@
 import json
+import math
 import sqlite3
 import time
 from collections.abc import Callable
@@ -20,8 +21,17 @@ def local(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, SHANGHAI).isoformat(timespec="seconds")
 
 
+def whole_second(epoch: float) -> int:
+    """The second shown in notices. fromtimestamp() rounds to microseconds and can
+    carry into the next second; every displayed time and the spans derived from
+    them use this one truncation instead."""
+    return math.floor(epoch)
+
+
 def mail_time(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch, SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(whole_second(epoch), SHANGHAI).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 def duration(seconds: float) -> str:
@@ -89,6 +99,11 @@ class MonitorState:
         self.identity_check: Pair | None = None
         # First non-live evidence since the session's last live sample.
         self.offline_first: float | None = row["offline_first"]
+        # Last read still attributable to the current session; see _track_session().
+        self.session_seen: float | None = row["session_seen"]
+        self.attributable = True  # Whether the read in _advance() is this session's.
+        # Monotonic completion of the newest committed observation (not persisted).
+        self.latest_end: float | None = None
         # Set by restore: sessions starting before it may already have been notified.
         self.restored_at: float | None = row["restored_at"]
         self.restore_quiet_since: float | None = None
@@ -96,6 +111,21 @@ class MonitorState:
         self.evidence_gap_limit = (
             2 * config.poll_interval_seconds + config.http_timeout_seconds
         )
+        if self.session is not None and self.session_seen is None:
+            # Upgraded from a version without this column. The last valid read may
+            # already belong to a new session; evidence saved before a gap still
+            # describes this one, and an older resume anchor must not outlive it.
+            self.session_seen = (
+                row["gap_reference"]
+                if row["gap_reference"] is not None
+                else self.last_valid
+            )
+            if (
+                self.session_seen is not None
+                and self.offline_first is not None
+                and self.offline_first - self.session_seen > self.evidence_gap_limit
+            ):
+                self.offline_first = self.session_seen
         # Keep the pre-outage reference across interrupted candidates and restarts.
         self.gap_reference: float | None = row["gap_reference"]
         self.first_live_after_gap: float | None = None
@@ -136,8 +166,8 @@ class MonitorState:
         self.db.execute(
             """UPDATE monitor SET confirmed=?, session_id=?, phase=?, last_valid=?,
                         stale_restart=?, window_first=?, samples=?, last_offline=?,
-                        replay_at=?, replay_start=?, offline_first=?, restored_at=?, gap_reference=?
-                        WHERE room=?""",
+                        replay_at=?, replay_start=?, offline_first=?, restored_at=?, gap_reference=?,
+                        session_seen=? WHERE room=?""",
             (
                 self.confirmed,
                 self.session,
@@ -152,6 +182,7 @@ class MonitorState:
                 self.offline_first,
                 self.restored_at,
                 self.gap_reference,
+                self.session_seen,
                 self.c.room_id,
             ),
         )
@@ -298,6 +329,7 @@ class MonitorState:
                 # The write lock can delay processing after the sample has returned.
                 self.resume_check = None
                 self._advance(o, now, trigger)
+                self._track_session(o, self.attributable)
                 usable = True
                 self._settle_restore(o)
                 self.last_valid = self.last_seen = o.utc
@@ -317,6 +349,7 @@ class MonitorState:
                 (int(usable), self.c.room_id),
             )
             self._persist()
+        self.latest_end = o.end
         audit(
             self.c,
             trigger,
@@ -354,6 +387,8 @@ class MonitorState:
             and o.started_at is not None
             and o.started_at > switch_after
         )
+        # A later start belongs to another session unless it resumes this one.
+        self.attributable = not switching or resuming
         if switching and resuming:
             # Back within the offline confirmation period: same broadcast, new start.
             audit(
@@ -396,7 +431,13 @@ class MonitorState:
 
         closing = self.confirmed == "LIVE_CONFIRMED" and not switching
         if closing and self.offline_first is None:
-            self.offline_first = o.utc
+            # The earliest moment the session may have ended. After an evidence
+            # gap (e.g. a long outage) that is the session's last read before the
+            # gap, so a later start cannot pass as a resume of this session. Reads
+            # of another session in between do not count (see _track_session).
+            seen = self.session_seen
+            continuous = seen is None or o.utc - seen <= self.evidence_gap_limit
+            self.offline_first = o.utc if continuous else seen
         kind = "LIVE" if live else "NONLIVE"
         w = self.window
         if w is not None and w.kind == kind:
@@ -519,7 +560,7 @@ class MonitorState:
 
     def _check_corrected_start(self, o: Observation) -> None:
         # Two consistent corrections establish identity for future switches.
-        # The start recorded for the original notice/duration stays unknown.
+        # A correction does not establish the original platform start.
         if o.started_at is None:
             self.correction_check = None
             return
@@ -561,15 +602,38 @@ class MonitorState:
             and self.gap_reference is None
         )
 
-    def _resumed(self, o: Observation) -> bool:
-        # Longer spans imply evidence gaps; the old end is then unknown.
+    def _resume_limit(self) -> float:
         c = self.c
-        limit = (
+        return (
             c.offline_confirm_seconds + c.poll_interval_seconds + c.http_timeout_seconds
         )
+
+    def _resumed(self, o: Observation) -> bool:
+        # Longer spans imply evidence gaps; the old end is then unknown.
         return (
-            self.offline_first is not None and 0 <= o.utc - self.offline_first <= limit
+            self.offline_first is not None
+            and 0 <= o.utc - self.offline_first <= self._resume_limit()
         )
+
+    def _track_session(self, o: Observation, attributable: bool) -> None:
+        """Remember the last read that still describes the current session.
+
+        Only an accepted LIVE read of this session counts: a replay can carry the
+        session's old start long after it ended, offline reads say nothing about
+        which session follows, and a read of another session never counts. After
+        a gap longer than a resume could bridge, the session may have ended unseen;
+        then only a read carrying the session's own start re-establishes it. A
+        shorter gap could only hide a drop that the resume rule treats as the same
+        broadcast anyway."""
+        seen = self.session_seen
+        if self.session is None or not attributable or o.state != "LIVE":
+            return
+        if (
+            seen is None
+            or o.utc - seen <= self._resume_limit()
+            or (o.started_at is not None and o.started_at == self.session_started_at)
+        ):
+            self.session_seen = o.utc
 
     def _open(self, w: Window, silent: bool) -> None:
         o = w.last
@@ -603,7 +667,7 @@ class MonitorState:
             ),
         )
         self.session = cur.lastrowid
-        self.session_live_at = o.utc
+        self.session_live_at = self.session_seen = o.utc
         self.confirmed = self.phase = "LIVE_CONFIRMED"
         self.stale = False
         self.offline_first = None
@@ -638,6 +702,33 @@ class MonitorState:
             else self._initial_delivery(c.notify_live)
         )
         self._enqueue("LIVE", state, subject, body, o.utc, html)
+
+    def _shown_live_time(self, live_at: float) -> int:
+        """The confirmation second printed in this session's live notice.
+
+        Versions up to 2.1.0 rounded to microseconds first and could print the next
+        second; reading the notice keeps the span equal to what the two notices
+        show. Falls back to whole_second() if the notice cannot be read."""
+        fallback = whole_second(live_at)
+        notice = self.db.execute(
+            "SELECT body FROM outbox WHERE session_id=? AND kind='LIVE' ORDER BY id",
+            (self.session,),
+        ).fetchone()
+        for line in notice[0].splitlines() if notice else ():
+            # 2.0.2 and later, then the ISO format of 2.0.1.
+            for prefix in ("本场确认开播时间：", "确认开播时间："):
+                if not line.startswith(prefix):
+                    continue
+                try:
+                    shown = datetime.fromisoformat(line[len(prefix) :].strip())
+                except ValueError:
+                    return fallback
+                if shown.tzinfo is None:
+                    shown = shown.replace(tzinfo=SHANGHAI)
+                second = int(shown.timestamp())
+                # Only rounding can differ; anything else is not this confirmation.
+                return second if abs(second - live_at) <= 1 else fallback
+        return fallback
 
     def _initial_delivery(self, enabled: bool) -> str:
         if not enabled:
@@ -679,12 +770,21 @@ class MonitorState:
                 state = "SUPPRESSED_NO_LIVE_NOTICE"
         subject = f"🌙 {row['name']} 下播休息啦～"
         first_start = row["first_started_at"]
-        # The stream ended before the first offline sample; the span is approximate.
-        length = (
-            f"约 {duration(w.first.utc - first_start)}"
-            if first_start is not None
-            else "未知"
-        )
+        elapsed: float | None = None
+        note = "缺少可信开播时间"
+        if first_start is not None:
+            elapsed, note = w.first.utc - first_start, "按开播时间估算"
+        elif not row["silent"] and not row["restored"]:
+            # Match the two confirmation timestamps printed to the second in the
+            # notices. A silent or restored session was confirmed only after it
+            # had started, at an unknown time: its confirmation dates nothing.
+            elapsed = whole_second(o.utc) - self._shown_live_time(row["live_at"])
+            note = ""
+        if elapsed is not None and elapsed < 0:
+            # The wall clock stepped back (or the platform's ran ahead) during
+            # the session: the span is unknown, not zero.
+            elapsed, note = None, "时间记录异常，无法计算"
+        length = f"约 {duration(elapsed)}" if elapsed is not None else "未知"
         body = (
             "🌙 直播间安静下来啦，记录放在这里～\n"
             f"直播间：https://www.douyu.com/{c.room_id}\n"
@@ -692,21 +792,21 @@ class MonitorState:
             f"确认下播时间：{mail_time(o.utc)}\n"
             f"直播时长：{length}"
         )
-        ended = datetime.fromtimestamp(o.utc, SHANGHAI)
+        ended = datetime.fromtimestamp(whole_second(o.utc), SHANGHAI)
         html = offline_html(
             subject=subject,
             name=row["name"],
             title=row["title"],
-            room_id=c.room_id,
             date=ended.strftime("%Y-%m-%d"),
             time=ended.strftime("%H:%M:%S"),
-            duration=length,
+            duration=length if elapsed is not None else None,
+            duration_note=note,
             brand=c.smtp_from_name,
         )
         self._enqueue("OFFLINE", state, subject, body, o.utc, html)
         self.session, self.window, self.stale = None, None, False
         self.gap_reference = None
-        self.offline_first = None
+        self.offline_first = self.session_seen = None
         self.confirmed = self.phase = "OFFLINE"
 
     def _enqueue(

@@ -329,3 +329,22 @@ def test_failed_mail_loop_still_marks_room_stopped(scenario):
     ):
         asyncio.run(service._supervise())
     assert s.db.execute("SELECT health FROM monitor").fetchone()[0] == "STOPPED"
+
+
+def test_mail_loop_checks_evidence_age_on_the_monotonic_clock(scenario):
+    s = scenario
+    service = Service(s.c, s.db, None, lambda: s.t, lambda: s.t)
+    assert service.evidence_age() is None  # Nothing read since start.
+    service.state.observe(Observation("OFFLINE", "fixture", s.t, s.t, s.t), "test")
+    s.t += 7
+    assert service.evidence_age() == 7
+    seen = []
+
+    def fake_process_one(c, transport, clock, stopping, evidence_age):
+        seen.append(evidence_age())
+        service.stop.set()
+        return False
+
+    with patch("live_alert.service.process_one", fake_process_one):
+        asyncio.run(service.mail_loop())
+    assert seen == [7]

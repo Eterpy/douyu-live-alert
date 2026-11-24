@@ -204,3 +204,88 @@ def test_disabled_notification_suppresses_preexisting_queue(scenario):
         ("LIVE", "SUPPRESSED_DISABLED"),
         ("OFFLINE", "SUPPRESSED_NO_LIVE_NOTICE"),
     ]
+
+
+@pytest.mark.parametrize("step_back", [1, 899])
+def test_wall_clock_step_back_defers_notice_until_it_catches_up(scenario, step_back):
+    from live_alert.mail import process_one
+
+    s = scenario
+    s.baseline()
+    s.feed("LIVE", 30)
+    s.feed("LIVE", 10)
+
+    def transport(c, msg, before_data):
+        before_data()
+        s.sent.append(msg)
+        return "SENT", "smtp_accepted"
+
+    # The host clock steps back right after the notice was queued.
+    assert not process_one(s.c, transport, lambda: s.t - step_back)
+    assert s.events() == [("LIVE", "PENDING")]  # Deferred, not expired.
+    assert s.db.execute("SELECT attempts FROM outbox").fetchone()[0] == 0
+    s.feed("LIVE", 5)  # The clock has caught up; fresh evidence is checked again.
+    assert s.worker()
+    assert s.events() == [("LIVE", "SENT")]
+
+
+def test_wall_clock_step_back_beyond_notice_age_expires_notice(scenario):
+    from live_alert.mail import process_one
+
+    s = scenario
+    s.baseline()
+    s.live()
+    age = s.c.max_notification_age_seconds
+    assert not process_one(s.c, None, lambda: s.t - age - 1)
+    assert s.events() == [("LIVE", "EXPIRED")]
+
+
+def test_stepped_back_clock_cannot_make_old_offline_evidence_fresh(scenario):
+    from live_alert.mail import process_one
+
+    s = scenario
+    s.restart(poll_interval_seconds=300)
+    s.baseline()
+    s.live()
+    assert s.worker()
+    s.offline()  # The offline notice is queued with its final evidence at T.
+    queued = s.t
+
+    def send(c, msg, before_data):
+        before_data()
+        s.sent.append(msg)
+        return "SENT", "smtp_accepted"
+
+    def age():  # The monotonic clock keeps counting: 120 s have really passed.
+        return queued + 120 - s.state.latest_end
+
+    # The wall clock stepped back 120 s and now reads T again; no read since.
+    assert not process_one(s.c, send, clock=lambda: queued, evidence_age=age)
+    assert s.events()[-1] == ("OFFLINE", "PENDING")
+    s.feed("OFFLINE", 120)  # A new read is fresh on both clocks.
+    assert s.worker()
+    assert s.events()[-1] == ("OFFLINE", "SENT")
+
+
+def test_small_step_back_cannot_hide_evidence_older_than_the_limit(scenario):
+    from live_alert.mail import eligibility, process_one
+
+    s = scenario
+    s.baseline()
+    s.feed("LIVE", 30)
+    s.feed("LIVE", 10)
+    observed = s.t
+    # The last read is really 5 s past the freshness limit of a live notice, but
+    # the wall clock stepped back 10 s after it, so by the wall clock it looks
+    # 5 s inside the limit. Comparing against the notice creation time cannot
+    # detect such a step: the clock never reads earlier than the evidence.
+    limit = s.c.poll_interval_seconds + s.c.http_timeout_seconds + 5
+    real_age = limit + 5
+    wall_now = observed + real_age - 10
+    row = s.db.execute("SELECT * FROM outbox").fetchone()
+    assert eligibility(s.db, s.c, row, wall_now) == "READY"  # Wall clock alone.
+    assert eligibility(s.db, s.c, row, wall_now, real_age) == "WAIT"
+    assert not process_one(
+        s.c, None, clock=lambda: wall_now, evidence_age=lambda: real_age
+    )
+    assert s.events() == [("LIVE", "PENDING")]

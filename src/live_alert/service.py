@@ -382,6 +382,11 @@ class Service:
             self.tick()
             await asyncio.sleep(10)
 
+    def evidence_age(self) -> float | None:
+        """Monotonic age of the newest observation; read from the mail thread."""
+        end = self.state.latest_end
+        return None if end is None else self.monotonic() - end
+
     async def mail_io(self, fn, *args):
         # Cancelling to_thread does not stop its thread. Drain the bounded operation
         # before closing/reusing its process or releasing the instance lock.
@@ -415,7 +420,12 @@ class Service:
                     await self.mail_io(warm.prepare)
                     prepared_key = w.first.id
                 worked = await self.mail_io(
-                    process_one, self.c, warm, time.time, self.halting.is_set
+                    process_one,
+                    self.c,
+                    warm,
+                    time.time,
+                    self.halting.is_set,
+                    self.evidence_age,
                 )
                 if not candidate or warm.expired:
                     await self.mail_io(warm.close)

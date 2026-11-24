@@ -92,18 +92,21 @@ def offline_html(
     subject: str,
     name: str,
     title: str,
-    room_id: int,
     date: str,
     time: str,
-    duration: str,
+    duration: str | None,
+    duration_note: str,
     brand: str,
 ) -> str:
-    known = duration != "未知"
-    preheader = f"{name} 已下播，本场{duration}" if known else f"{name} 已下播"
-    note = "按开播时间估算" if known else "缺少可信开播时间"
+    """duration is None when it cannot be determined; duration_note says how it
+    was derived or why it is unknown, or is empty."""
+    preheader = f"{name} 已下播，本场{duration}" if duration else f"{name} 已下播"
     tile = "background:#f7f7fc;border-radius:12px;padding:16px 18px;vertical-align:top;"
     value = "margin-top:6px;font-size:20px;font-weight:700;color:#3b3f8f;font-variant-numeric:tabular-nums;"
     small = "margin-top:2px;font-size:12px;color:#6b6f91;"
+    note_row = (
+        f'<div style="{small}">{escape(duration_note)}</div>' if duration_note else ""
+    )
     rows = f"""<tr><td bgcolor="#34346e" style="background:#34346e;background-image:linear-gradient(135deg,#232452 0%,#4b3f8f 100%);padding:28px 32px 26px;">
 <span style="float:right;color:#c9cdf5;font-size:13px;letter-spacing:6px;">✦ · ✧ · ✦</span>
 <span style="display:inline-block;background:rgba(255,255,255,0.14);color:#d9dcff;font-size:12px;font-weight:600;letter-spacing:1.5px;padding:4px 12px;border-radius:999px;">OFFLINE · 已下播</span>
@@ -116,8 +119,8 @@ def offline_html(
 <tr>
 <td width="48%" valign="top" bgcolor="#f7f7fc" style="{tile}">
 <div style="font-size:12px;color:#8a8fb5;">⏱️ 直播时长</div>
-<div style="{value}">{escape(duration)}</div>
-<div style="{small}">{note}</div>
+<div style="{value}">{escape(duration or "未知")}</div>
+{note_row}
 </td>
 <td width="4%" style="font-size:0;line-height:0;">&nbsp;</td>
 <td width="48%" valign="top" bgcolor="#f7f7fc" style="{tile}">
